@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Local PyQt GUI for the cooperative handling virtual object layer."""
+"""Reusable PyQt base GUI for MuR robot operation."""
 
 import os
 import shlex
-import signal
-import sys
 import threading
 import time
 import math
@@ -23,7 +21,7 @@ from geometry_msgs.msg import TwistStamped
 from lifecycle_msgs.msg import State, TransitionEvent
 from rclpy.executors import ExternalShutdownException
 from sensor_msgs.msg import BatteryState, JointState
-from std_msgs.msg import Bool, Float32, String
+from std_msgs.msg import Bool, Float32
 from std_srvs.srv import Trigger
 from ewellix_interfaces.msg import Command as EwellixCommand
 
@@ -42,10 +40,8 @@ REMOTE_HOST_SETUP_REL = os.path.join(
 REMOTE_HOST_DIAG_REL = os.path.join(
     "src", "match_mobile_robotics_jazzy", "diagnose_mur_hardware_host.sh"
 )
-PACKAGE = "match_cooperative_handling"
 ROBOTS = ["mur620a", "mur620b", "mur620c", "mur620d"]
 SIDES = {"r": "UR10_r", "l": "UR10_l"}
-WORLD_FRAME = "map"
 FREEDRIVE_CONTROLLER = "freedrive_mode_controller"
 FREEDRIVE_ENABLE_WAIT_SEC = 3.0
 FREEDRIVE_ACTIVE_TRANSITION_WAIT_SEC = 4.0
@@ -136,7 +132,6 @@ class BatteryBadge(QtWidgets.QWidget):
 
 class RosWorker(QtCore.QThread):
     log = QtCore.pyqtSignal(str)
-    status = QtCore.pyqtSignal(str, str, str)
     freedrive_status = QtCore.pyqtSignal(str, str, bool, str)
     battery_status = QtCore.pyqtSignal(str, str, float, bool)
 
@@ -144,13 +139,10 @@ class RosWorker(QtCore.QThread):
         super().__init__()
         self.robot_names = list(robot_names or ["mur620d"])
         self._node = None
-        self._object_twist_pub = None
-        self._tracking_stop_pub = None
         self._arm_twist_pubs = {}
         self._lift_command_pubs = {}
         self._joint_positions = {}
         self._joint_state_sub = None
-        self._status_subs = []
         self._battery_subs = []
         self._previous_freedrive_controllers = {}
         self._freedrive_enable_pubs = {}
@@ -162,17 +154,10 @@ class RosWorker(QtCore.QThread):
 
     def run(self):
         rclpy.init(args=None)
-        self._node = rclpy.create_node("cooperative_handling_gui")
-        self._object_twist_pub = self._node.create_publisher(
-            TwistStamped, "/virtual_object/object_twist_cmd", 10
-        )
-        self._tracking_stop_pub = self._node.create_publisher(
-            Bool, "/cooperative_tracking_logger/stop", 10
-        )
+        self._node = rclpy.create_node("mur_gui")
         self._joint_state_sub = self._node.create_subscription(
             JointState, "/joint_states", self._on_joint_states, 50
         )
-        self._configure_status_subscriptions(self.robot_names)
         self._configure_battery_subscriptions(self.robot_names)
         self._ready.set()
         self.log.emit("[ros] GUI ROS helper started")
@@ -184,7 +169,6 @@ class RosWorker(QtCore.QThread):
             pass
         finally:
             if rclpy.ok():
-                self.publish_object_twist([0.0] * 6)
                 self._stop_all_freedrive_keepalives()
             if self._node is not None:
                 self._node.destroy_node()
@@ -198,29 +182,7 @@ class RosWorker(QtCore.QThread):
     def set_robot_names(self, robot_names):
         self.robot_names = list(robot_names or ["mur620d"])
         if self._ready.wait(timeout=1.0):
-            self._configure_status_subscriptions(self.robot_names)
             self._configure_battery_subscriptions(self.robot_names)
-
-    def _configure_status_subscriptions(self, robot_names):
-        with self._lock:
-            if self._node is None:
-                return
-            for sub in self._status_subs:
-                self._node.destroy_subscription(sub)
-            self._status_subs = []
-            for robot_name in robot_names:
-                for side, prefix in SIDES.items():
-                    topic = f"/{robot_name}/{prefix}/virtual_object_tcp_transform_node/status"
-                    sub = self._node.create_subscription(
-                        String,
-                        topic,
-                        partial(self._on_status, robot_name, side),
-                        10,
-                    )
-                    self._status_subs.append(sub)
-
-    def _on_status(self, robot_name, side, msg):
-        self.status.emit(robot_name, side, msg.data)
 
     def _configure_battery_subscriptions(self, robot_names):
         with self._lock:
@@ -616,20 +578,6 @@ class RosWorker(QtCore.QThread):
         self.log.emit(f"[ros] {message}")
         self.freedrive_status.emit(robot_name, side, False if ok else True, message)
 
-    def publish_object_twist(self, values):
-        if self._object_twist_pub is None:
-            return
-        msg = TwistStamped()
-        msg.header.stamp = self._node.get_clock().now().to_msg()
-        msg.header.frame_id = WORLD_FRAME
-        msg.twist.linear.x = float(values[0])
-        msg.twist.linear.y = float(values[1])
-        msg.twist.linear.z = float(values[2])
-        msg.twist.angular.x = float(values[3])
-        msg.twist.angular.y = float(values[4])
-        msg.twist.angular.z = float(values[5])
-        self._object_twist_pub.publish(msg)
-
     def publish_arm_twist(self, robot_name, side, values):
         if self._node is None:
             return
@@ -670,131 +618,6 @@ class RosWorker(QtCore.QThread):
         if publisher.get_subscription_count() == 0:
             return False, f"sent lift target {meters:.4f} m on {topic}, no subscriber discovered"
         return True, f"sent lift target {meters:.4f} m on {topic}"
-
-    def publish_tracking_stop(self):
-        if self._tracking_stop_pub is None:
-            return
-        msg = Bool()
-        msg.data = True
-        for _ in range(5):
-            self._tracking_stop_pub.publish(msg)
-            self.msleep(20)
-
-
-class ObjectJogDialog(QtWidgets.QDialog):
-    def __init__(self, ros_worker, parent=None):
-        super().__init__(parent)
-        self.ros_worker = ros_worker
-        self.setWindowTitle("Virtual Object Jog")
-        self.setMinimumWidth(430)
-        self.mode = "translation"
-        self.active = [0.0] * 6
-        self.linear_speed = QtWidgets.QDoubleSpinBox()
-        self.linear_speed.setRange(0.001, 0.2)
-        self.linear_speed.setDecimals(3)
-        self.linear_speed.setSingleStep(0.005)
-        self.linear_speed.setValue(0.01)
-        self.angular_speed = QtWidgets.QDoubleSpinBox()
-        self.angular_speed.setRange(0.01, 1.0)
-        self.angular_speed.setDecimals(3)
-        self.angular_speed.setSingleStep(0.05)
-        self.angular_speed.setValue(0.1)
-        self.mode_label = QtWidgets.QLabel("Mode: translation")
-        self.mode_label.setAlignment(QtCore.Qt.AlignCenter)
-
-        layout = QtWidgets.QVBoxLayout(self)
-        speed_row = QtWidgets.QHBoxLayout()
-        speed_row.addWidget(QtWidgets.QLabel("Linear m/s"))
-        speed_row.addWidget(self.linear_speed)
-        speed_row.addWidget(QtWidgets.QLabel("Angular rad/s"))
-        speed_row.addWidget(self.angular_speed)
-        layout.addLayout(speed_row)
-        layout.addWidget(self.mode_label)
-
-        grid = QtWidgets.QGridLayout()
-        self._add_button(grid, "Y+", 0, 1, [0, 1, 0])
-        self._add_button(grid, "X-", 1, 0, [-1, 0, 0])
-        stop_button = QtWidgets.QPushButton("STOP")
-        stop_button.setMinimumHeight(48)
-        stop_button.clicked.connect(self.stop)
-        grid.addWidget(stop_button, 1, 1)
-        self._add_button(grid, "X+", 1, 2, [1, 0, 0])
-        self._add_button(grid, "Y-", 2, 1, [0, -1, 0])
-        self._add_button(grid, "Z+", 0, 3, [0, 0, 1])
-        self._add_button(grid, "Z-", 2, 3, [0, 0, -1])
-        layout.addLayout(grid)
-
-        hint = QtWidgets.QLabel("Keys: arrows X/Y, PgUp/PgDn Z, M mode, Space stop")
-        hint.setAlignment(QtCore.Qt.AlignCenter)
-        layout.addWidget(hint)
-
-        self.timer = QtCore.QTimer(self)
-        self.timer.timeout.connect(self._tick)
-        self.timer.start(50)
-
-    def _add_button(self, grid, text, row, column, vector):
-        button = QtWidgets.QPushButton(text)
-        button.setMinimumHeight(48)
-        button.pressed.connect(partial(self._set_axis, vector))
-        button.released.connect(self.stop)
-        grid.addWidget(button, row, column)
-
-    def _set_axis(self, vector):
-        self.active = [0.0] * 6
-        offset = 0 if self.mode == "translation" else 3
-        speed = self.linear_speed.value() if self.mode == "translation" else self.angular_speed.value()
-        for index, value in enumerate(vector):
-            self.active[offset + index] = value * speed
-
-    def _tick(self):
-        self.ros_worker.publish_object_twist(self.active)
-
-    def stop(self):
-        self.active = [0.0] * 6
-        self.ros_worker.publish_object_twist(self.active)
-
-    def toggle_mode(self):
-        self.mode = "rotation" if self.mode == "translation" else "translation"
-        self.mode_label.setText(f"Mode: {self.mode}")
-        self.stop()
-
-    def keyPressEvent(self, event):
-        key = event.key()
-        if key == QtCore.Qt.Key_M:
-            self.toggle_mode()
-            return
-        if key in (QtCore.Qt.Key_Space, QtCore.Qt.Key_Period):
-            self.stop()
-            return
-        mapping = {
-            QtCore.Qt.Key_Left: [-1, 0, 0],
-            QtCore.Qt.Key_Right: [1, 0, 0],
-            QtCore.Qt.Key_Up: [0, 1, 0],
-            QtCore.Qt.Key_Down: [0, -1, 0],
-            QtCore.Qt.Key_PageUp: [0, 0, 1],
-            QtCore.Qt.Key_PageDown: [0, 0, -1],
-        }
-        if key in mapping:
-            self._set_axis(mapping[key])
-            return
-        super().keyPressEvent(event)
-
-    def keyReleaseEvent(self, event):
-        if event.key() in (
-            QtCore.Qt.Key_Left,
-            QtCore.Qt.Key_Right,
-            QtCore.Qt.Key_Up,
-            QtCore.Qt.Key_Down,
-            QtCore.Qt.Key_PageUp,
-            QtCore.Qt.Key_PageDown,
-        ):
-            self.stop()
-            return
-        super().keyReleaseEvent(event)
-
-    def closeEvent(self, event):
-        self.stop()
-        super().closeEvent(event)
 
 
 class ManipulatorJogDialog(QtWidgets.QDialog):
@@ -983,108 +806,106 @@ class ManipulatorJogDialog(QtWidgets.QDialog):
         super().closeEvent(event)
 
 
-class DemoDialog(QtWidgets.QDialog):
-    def __init__(self, main_window, parent=None):
-        super().__init__(parent)
-        self.main_window = main_window
-        self.setWindowTitle("Cooperative Handling Demos")
-        self.setMinimumWidth(520)
+class MurGuiModule:
+    """Base class for externally provided GUI modules."""
 
-        layout = QtWidgets.QVBoxLayout(self)
+    def setup_ui(self, context):
+        raise NotImplementedError
 
-        demo_box = QtWidgets.QGroupBox("Demo")
-        demo_layout = QtWidgets.QVBoxLayout(demo_box)
-        self.demo_combo = QtWidgets.QComboBox()
-        self.demo_combo.addItem("Safe Wiggle", "safe_wiggle")
-        demo_layout.addWidget(self.demo_combo)
-        catalog = QtWidgets.QLabel(
-            "Prepared next: Rounded Rectangle, Ellipse/Figure Eight, Tilt Demo, Teach Workspace"
+    def stop_motion_like_actions(self):
+        pass
+
+    def on_hardware_start(self):
+        self.stop_motion_like_actions()
+
+    def on_robot_selection_changed(self):
+        pass
+
+    def on_shutdown(self):
+        pass
+
+
+class MurGuiContext:
+    """Narrow integration surface exposed to application-specific modules."""
+
+    def __init__(self, window):
+        self.window = window
+
+    @property
+    def ros_worker(self):
+        return self.window.ros_worker
+
+    def append_log(self, text):
+        self.window.append_log(text)
+
+    def start_process(self, name, command, env=None, on_finished=None):
+        self.window.start_process(name, command, env=env, on_finished=on_finished)
+
+    def remote_command(self, robot, command):
+        return self.window.remote_command(robot, command)
+
+    def remote_ros_command(self, robot, command):
+        return self.window.remote_ros_command(robot, command)
+
+    def remote_setup_prefix(self):
+        return self.window.remote_setup_prefix()
+
+    def selected_robots(self):
+        return self.window.selected_robots()
+
+    def selected_sides(self):
+        return self.window.selected_sides()
+
+    def object_host(self):
+        return self.window.object_host()
+
+    def robot_arm_pairs(self, robots=None, sides=None):
+        return self.window.robot_arm_pairs(robots=robots, sides=sides)
+
+    def process_key(self, robot, name):
+        return self.window.process_key(robot, name)
+
+    def fallback_motion_controller(self):
+        return self.window.fallback_motion_controller()
+
+    def set_arm_status(self, robot, side, status):
+        self.window.update_arm_status(robot, side, status)
+
+    def arm_status(self, robot, side):
+        return self.window.arm_status.get((robot, side), "unknown")
+
+    def ur_reverse_ready(self, robot, side):
+        return self.window.ur_reverse_ready.get((robot, side), False)
+
+    def add_action_button(self, text, callback):
+        return self.window.add_action_button(text, callback)
+
+    def add_tool_button(self, text, callback):
+        return self.window.add_tool_button(text, callback)
+
+    def add_bottom_widget(self, widget):
+        self.window.bottom_layout.addWidget(widget)
+        return widget
+
+    def add_status_row(self, label_text, widget):
+        self.window.status_layout.addRow(label_text, widget)
+        return widget
+
+    def ensure_ur_ready(self, sides=None, robots=None, on_success=None, retry_count=0):
+        return self.window.ensure_ur_ready(
+            sides=sides,
+            robots=robots,
+            on_success=on_success,
+            retry_count=retry_count,
         )
-        catalog.setWordWrap(True)
-        demo_layout.addWidget(catalog)
-        layout.addWidget(demo_box)
-
-        params = QtWidgets.QGroupBox("Safe Wiggle Parameters")
-        form = QtWidgets.QFormLayout(params)
-        self.xy_amplitude = QtWidgets.QDoubleSpinBox()
-        self.xy_amplitude.setRange(0.001, 0.2)
-        self.xy_amplitude.setDecimals(3)
-        self.xy_amplitude.setSingleStep(0.005)
-        self.xy_amplitude.setValue(0.05)
-        form.addRow("XY amplitude [m]", self.xy_amplitude)
-
-        self.z_lift = QtWidgets.QDoubleSpinBox()
-        self.z_lift.setRange(0.001, 0.2)
-        self.z_lift.setDecimals(3)
-        self.z_lift.setSingleStep(0.005)
-        self.z_lift.setValue(0.05)
-        form.addRow("Z lift [m]", self.z_lift)
-
-        self.yaw_amplitude = QtWidgets.QDoubleSpinBox()
-        self.yaw_amplitude.setRange(0.1, 30.0)
-        self.yaw_amplitude.setDecimals(1)
-        self.yaw_amplitude.setSingleStep(1.0)
-        self.yaw_amplitude.setValue(5.0)
-        form.addRow("Yaw amplitude [deg]", self.yaw_amplitude)
-
-        self.linear_velocity = QtWidgets.QDoubleSpinBox()
-        self.linear_velocity.setRange(0.001, 0.15)
-        self.linear_velocity.setDecimals(3)
-        self.linear_velocity.setSingleStep(0.005)
-        self.linear_velocity.setValue(0.02)
-        form.addRow("Linear velocity [m/s]", self.linear_velocity)
-
-        self.angular_velocity = QtWidgets.QDoubleSpinBox()
-        self.angular_velocity.setRange(0.01, 0.8)
-        self.angular_velocity.setDecimals(3)
-        self.angular_velocity.setSingleStep(0.05)
-        self.angular_velocity.setValue(0.10)
-        form.addRow("Angular velocity [rad/s]", self.angular_velocity)
-
-        self.repetitions = QtWidgets.QSpinBox()
-        self.repetitions.setRange(1, 20)
-        self.repetitions.setValue(1)
-        form.addRow("Repetitions", self.repetitions)
-        layout.addWidget(params)
-
-        hint = QtWidgets.QLabel(
-            "Demos do not arm the robot. Press START MOTION first, then start a demo."
-        )
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
-        buttons = QtWidgets.QHBoxLayout()
-        start = QtWidgets.QPushButton("Start Demo")
-        start.setMinimumHeight(42)
-        start.clicked.connect(self.start_demo)
-        stop = QtWidgets.QPushButton("Stop Demo")
-        stop.setMinimumHeight(42)
-        stop.clicked.connect(self.main_window.stop_demo)
-        buttons.addWidget(start)
-        buttons.addWidget(stop)
-        layout.addLayout(buttons)
-
-    def start_demo(self):
-        self.main_window.start_demo(
-            demo_name=self.demo_combo.currentData(),
-            xy_amplitude=self.xy_amplitude.value(),
-            z_lift=self.z_lift.value(),
-            yaw_amplitude_deg=self.yaw_amplitude.value(),
-            linear_velocity=self.linear_velocity.value(),
-            angular_velocity=self.angular_velocity.value(),
-            repetitions=self.repetitions.value(),
-        )
-
-    def closeEvent(self, event):
-        self.main_window.stop_demo()
-        super().closeEvent(event)
 
 
-class CooperativeHandlingGui(QtWidgets.QMainWindow):
-    def __init__(self, cooperative_mode=True):
+class MurBaseGui(QtWidgets.QMainWindow):
+    def __init__(self, modules=None, window_title="General MuR GUI"):
         super().__init__()
-        self.cooperative_mode = cooperative_mode
-        self.setWindowTitle("MuR Cooperative Handling" if cooperative_mode else "General MuR GUI")
+        self.modules = list(modules or [])
+        self.module_context = MurGuiContext(self)
+        self.setWindowTitle(window_title)
         self.resize(1180, 780)
         self.processes = {}
         self.arm_status = {}
@@ -1098,7 +919,6 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
 
         self.ros_worker = RosWorker(["mur620d"])
         self.ros_worker.log.connect(self.append_log)
-        self.ros_worker.status.connect(self.update_arm_status)
         self.ros_worker.freedrive_status.connect(self.update_freedrive_status)
         self.ros_worker.battery_status.connect(self.update_battery_status)
         self.ros_worker.start()
@@ -1114,6 +934,7 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         top.addWidget(self._build_status_box())
 
         actions = QtWidgets.QHBoxLayout()
+        self.action_layout = actions
         root.addLayout(actions)
         action_buttons = [
             self._button("Connect", self.connect_selected_robots),
@@ -1121,19 +942,12 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             self._button("Start Hardware", self.start_hardware),
             self._button("Enable URs / Ready", self.ensure_ur_ready),
         ]
-        if self.cooperative_mode:
-            action_buttons.extend([
-                self._button("Start Object Nodes", self.start_object_nodes),
-                self._button("Set From TCP", self.set_from_tcp),
-            ])
         action_buttons.extend([
             self._button("Home L", partial(self.move_home, "l")),
             self._button("Home R", partial(self.move_home, "r")),
             self._button("Jog L", partial(self.open_manipulator_jog, "l")),
             self._button("Jog R", partial(self.open_manipulator_jog, "r")),
         ])
-        if self.cooperative_mode:
-            action_buttons.append(self._button("Open Object Jog", self.open_object_jog))
         action_buttons.extend([
             self._button("Freedrive", self.toggle_freedrive),
             self._button("Stop Managed Processes", self.stop_managed_processes),
@@ -1148,16 +962,9 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
                 self.update_freedrive_button()
 
         tools = QtWidgets.QHBoxLayout()
+        self.tool_layout = tools
         root.addLayout(tools)
         tool_buttons = [self._button("Open RViz", self.open_rviz)]
-        if self.cooperative_mode:
-            tool_buttons.extend([
-                self._button("Demos", self.open_demos),
-                self._button("Start Tracking Log", self.start_tracking_log),
-                self._button("Stop Tracking Log", self.stop_tracking_log),
-                self._button("Set Object Center", self.set_object_center),
-                self._button("Set Current Offsets", self.set_current_offsets),
-            ])
         for button in tool_buttons:
             tools.addWidget(button)
         tools.addStretch(1)
@@ -1168,35 +975,14 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         self.terminal.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont))
         root.addWidget(self.terminal, 1)
 
-        if self.cooperative_mode:
-            bottom = QtWidgets.QHBoxLayout()
-            root.addLayout(bottom)
-            bottom.addStretch(1)
-            self.start_motion_button = QtWidgets.QPushButton("START MOTION")
-            self.start_motion_button.setMinimumSize(220, 72)
-            self.start_motion_button.setStyleSheet(
-                "QPushButton { background: #1f9d55; color: white; font-size: 22px; font-weight: bold; }"
-            )
-            self.start_motion_button.clicked.connect(self.start_motion)
-            bottom.addWidget(self.start_motion_button)
-            self.stop_motion_button = QtWidgets.QPushButton("STOP MOTION")
-            self.stop_motion_button.setMinimumSize(220, 72)
-            self.stop_motion_button.setStyleSheet(
-                "QPushButton { background: #c53030; color: white; font-size: 22px; font-weight: bold; }"
-            )
-            self.stop_motion_button.clicked.connect(self.stop_motion)
-            bottom.addWidget(self.stop_motion_button)
+        self.bottom_layout = QtWidgets.QHBoxLayout()
+        root.addLayout(self.bottom_layout)
+        self.bottom_layout.addStretch(1)
 
-        if self.cooperative_mode:
-            self.append_log(
-                "[gui] Ready. START MOTION only arms virtual-object control; "
-                "Home L/R uses MoveIt separately."
-            )
-        else:
-            self.append_log(
-                "[gui] Ready. General MuR controls are active; cooperative virtual-object "
-                "functions are not loaded in this window."
-            )
+        for module in self.modules:
+            module.setup_ui(self.module_context)
+
+        self.append_log("[gui] Ready. General MuR controls are active.")
 
     def _build_robot_box(self):
         box = QtWidgets.QGroupBox("Robot")
@@ -1284,8 +1070,9 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         return box
 
     def _build_status_box(self):
-        box = QtWidgets.QGroupBox("Motion Gate" if self.cooperative_mode else "Arm Status")
+        box = QtWidgets.QGroupBox("Arm Status")
         layout = QtWidgets.QFormLayout(box)
+        self.status_layout = layout
         self.status_labels = {}
         for robot in ROBOTS:
             for side, prefix in SIDES.items():
@@ -1302,6 +1089,17 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
     def _button(self, text, callback):
         button = QtWidgets.QPushButton(text)
         button.clicked.connect(callback)
+        return button
+
+    def add_action_button(self, text, callback):
+        button = self._button(text, callback)
+        self.action_layout.addWidget(button)
+        return button
+
+    def add_tool_button(self, text, callback):
+        button = self._button(text, callback)
+        index = max(0, self.tool_layout.count() - 1)
+        self.tool_layout.insertWidget(index, button)
         return button
 
     def update_moveit_speed_label(self, value):
@@ -1381,6 +1179,8 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
     def on_robot_selection_changed(self):
         selected = self.selected_robots()
         self.ros_worker.set_robot_names(selected)
+        for module in self.modules:
+            module.on_robot_selection_changed()
         for robot in ROBOTS:
             for side in SIDES:
                 self.arm_status[(robot, side)] = "unknown"
@@ -1675,10 +1475,8 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             )
 
     def start_hardware(self):
-        self.stop_demo()
-        self.ros_worker.publish_object_twist([0.0] * 6)
-        if self.cooperative_mode:
-            self.stop_object_nodes(start_after_cleanup=False)
+        for module in self.modules:
+            module.on_hardware_start()
         for robot in self.selected_robots():
             for side in self.selected_sides():
                 self.ur_reverse_ready[(robot, side)] = False
@@ -1758,7 +1556,7 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
                 f"export ROS_DOMAIN_ID={shlex.quote(os.environ.get('ROS_DOMAIN_ID', '62'))};",
                 f"export ROBOT_PROFILE={shlex.quote(robot)};",
                 f"export BUILD_BEFORE_LAUNCH={'true' if self.opt_build.isChecked() else 'false'};",
-                "export BUILD_PACKAGES='serial ewellix_driver mur_control mur_moveit_config mur_launch_hardware match_cooperative_handling';",
+                "export BUILD_PACKAGES='serial ewellix_driver mur_control mur_moveit_config mur_launch_hardware match_mur_gui';",
                 f"export MUR_CHECK_UR_NETWORK={'true' if self.selected_sides() else 'false'};",
                 f"export MUR_UR_HOSTS={shlex.quote(' '.join(['UR10_l' if side == 'l' else 'UR10_r' for side in self.selected_sides()]))};",
                 f"export INTEGRATED_CARTESIAN_ACTIVE={'true' if self.opt_integrated.isChecked() else 'false'};",
@@ -1833,7 +1631,7 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
             for side in selected:
                 prefix = SIDES[side]
                 commands.append(
-                    "ros2 run match_cooperative_handling ensure_ur_ready.py --ros-args "
+                    "ros2 run match_mur_gui ensure_ur_ready.py --ros-args "
                     + f"-p arm_namespace:=/{robot}/{prefix} "
                     + "-p wait_timeout:=30.0 "
                     + "-p target_robot_mode:=7 "
@@ -1886,182 +1684,16 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
 
         poll()
 
-    def start_object_nodes(self):
-        self.stop_demo()
-        self.ros_worker.publish_object_twist([0.0] * 6)
-        self.stop_object_nodes(start_after_cleanup=True)
-
-    def stop_object_nodes(self, start_after_cleanup=False):
-        cleanup_process = self.processes.get("object_cleanup")
-        if cleanup_process is not None and cleanup_process.state() != QtCore.QProcess.NotRunning:
-            self.append_log("[gui] terminating previous object_cleanup")
-            cleanup_process.terminate()
-            if not cleanup_process.waitForFinished(1000):
-                cleanup_process.kill()
-
-        managed_names = ["map_tf", "object_state"]
-        for robot in ROBOTS:
-            managed_names.extend([
-                self.process_key(robot, "map_tf"),
-                self.process_key(robot, "object_state"),
-            ])
-            for side in SIDES:
-                managed_names.append(self.process_key(robot, f"object_transform_{side}"))
-        for name in managed_names:
-            process = self.processes.get(name)
-            if process is not None and process.state() != QtCore.QProcess.NotRunning:
-                self.append_log(f"[gui] terminating {name}")
-                process.terminate()
-                if not process.waitForFinished(1000):
-                    process.kill()
-
-        cleanup_patterns = [
-            "/match_cooperative_handling/[v]irtual_object_state_node",
-            "match_cooperative_handling [v]irtual_object_state_node",
-            "/match_cooperative_handling/[v]irtual_object_tcp_transform_node",
-            "match_cooperative_handling [v]irtual_object_tcp_transform_node",
-        ]
-        cleanup_cmd = " ; ".join(
-            f"pkill -TERM -f {shlex.quote(pattern)} 2>/dev/null || true"
-            for pattern in cleanup_patterns
-        )
-        cleanup_cmd += " ; sleep 0.5 ; "
-        cleanup_cmd += " ; ".join(
-            f"pkill -KILL -f {shlex.quote(pattern)} 2>/dev/null || true"
-            for pattern in cleanup_patterns
-        )
-
-        remote_cleanup = []
-        for robot in self.selected_robots():
-            remote_cleanup.append(self.remote_command(robot, cleanup_cmd))
-        if remote_cleanup:
-            cleanup_cmd = " ; ".join(remote_cleanup)
-
-        if start_after_cleanup:
-            self.append_log("[gui] Restarting virtual object nodes with a clean slate")
-            self.start_process(
-                "object_cleanup",
-                cleanup_cmd,
-                on_finished=lambda _code, _status: self._start_object_nodes_after_cleanup(),
-            )
-        else:
-            self.append_log("[gui] Stopping virtual object nodes")
-            self.start_process("object_cleanup", cleanup_cmd)
-
-    def _start_object_nodes_after_cleanup(self):
-        object_host = self.object_host()
-        map_cmd = (
-            self.remote_setup_prefix()
-            + f"exec ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 "
-            + f"{WORLD_FRAME} {object_host}/base_link"
-        )
-        self.start_process(
-            self.process_key(object_host, "map_tf"),
-            self.remote_command(object_host, map_cmd),
-        )
-        state_cmd = (
-            self.remote_setup_prefix()
-            + "exec ros2 run match_cooperative_handling virtual_object_state_node --ros-args "
-            + f"-p world_frame:={WORLD_FRAME} "
-            + "-p rate:=500.0"
-        )
-        self.start_process(
-            self.process_key(object_host, "object_state"),
-            self.remote_command(object_host, state_cmd),
-        )
-        for robot in self.selected_robots():
-            for side in self.selected_sides():
-                prefix = SIDES[side]
-                transform_cmd = (
-                    self.remote_setup_prefix()
-                    + "exec ros2 run match_cooperative_handling virtual_object_tcp_transform_node --ros-args "
-                    + f"-r __ns:=/{robot}/{prefix} "
-                    + f"-p robot_name:={robot} "
-                    + f"-p arm:={side} "
-                    + f"-p world_frame:={WORLD_FRAME} "
-                    + "-p rate:=500.0"
-                )
-                self.start_process(
-                    self.process_key(robot, f"object_transform_{side}"),
-                    self.remote_command(robot, transform_cmd),
-                )
-
-    def set_from_tcp(self):
-        side = "r" if self.arm_r.isChecked() else "l"
-        robot = self.object_host()
-        cmd = (
-            self.remote_setup_prefix()
-            + "exec ros2 run match_cooperative_handling set_virtual_object_from_tcp.py --ros-args "
-            + f"-p robot_name:={robot} "
-            + f"-p arm:={side} "
-            + f"-p world_frame:={WORLD_FRAME}"
-        )
-        self.start_process(
-            self.process_key(robot, f"set_from_tcp_{side}"),
-            self.remote_command(robot, cmd),
-        )
-
-    def set_object_center(self):
-        sides = self.selected_sides()
-        if len(sides) < 2:
-            self.append_log("[gui] Refusing object center: select at least two manipulators")
-            return
-        robot = self.object_host()
-        arms = ",".join(sides)
-        cmd = (
-            self.remote_setup_prefix()
-            + "exec ros2 run match_cooperative_handling "
-            + "set_virtual_object_from_manipulators.py --ros-args "
-            + f"-p robot_name:={robot} "
-            + f"-p arms:={arms} "
-            + f"-p world_frame:={WORLD_FRAME}"
-        )
-        self.append_log(
-            f"[gui] Setting virtual object center on {robot} from selected manipulators: {arms}"
-        )
-        self.start_process(
-            self.process_key(robot, "set_object_center"),
-            self.remote_command(robot, cmd),
-        )
-
-    def set_current_offsets(self):
-        sides = self.selected_sides()
-        if not sides:
-            self.append_log("[gui] Refusing current offsets: select at least one manipulator")
-            return
-        arms = ",".join(sides)
-        for robot in self.selected_robots():
-            cmd = (
-                self.remote_setup_prefix()
-                + "exec ros2 run match_cooperative_handling "
-                + "set_relative_pose_from_current_object.py --ros-args "
-                + f"-p robot_name:={robot} "
-                + f"-p arms:={arms} "
-                + f"-p world_frame:={WORLD_FRAME} "
-                + "-p object_frame:=virtual_object/base_link "
-                + "-p max_distance:=2.0"
-            )
-            self.append_log(
-                f"[gui] Setting current object-relative TCP offsets for {robot}: {arms}"
-            )
-            self.start_process(
-                self.process_key(robot, "set_current_offsets"),
-                self.remote_command(robot, cmd),
-            )
-
-    def open_object_jog(self):
-        dialog = ObjectJogDialog(self.ros_worker, self)
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
-        self._jog_dialog = dialog
-
     def open_manipulator_jog(self, side):
         dialog = ManipulatorJogDialog(self, side, self)
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
         self._manipulator_jog_dialog = dialog
+
+    def stop_module_motion_like_actions(self):
+        for module in self.modules:
+            module.stop_motion_like_actions()
 
     def toggle_freedrive(self):
         pairs = self.robot_arm_pairs()
@@ -2072,126 +1704,16 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         fallback = self.fallback_motion_controller()
         if enable:
             self.append_log(
-                "[gui] Enabling freedrive: stopping demos, object twists, and motion gates first"
+                "[gui] Enabling freedrive: stopping module motion first"
             )
-            self.stop_demo()
-            self.ros_worker.publish_object_twist([0.0] * 6)
+            self.stop_module_motion_like_actions()
             for robot, side in pairs:
-                service = f"/{robot}/{SIDES[side]}/virtual_object_tcp_transform_node/stop"
-                self.ros_worker.call_trigger(
-                    service, f"disarm before freedrive {robot}/{SIDES[side]}"
-                )
                 self.ros_worker.switch_freedrive(robot, side, True, fallback)
             return
 
         self.append_log("[gui] Disabling freedrive and restoring previous motion controllers")
         for robot, side in pairs:
             self.ros_worker.switch_freedrive(robot, side, False, fallback)
-
-    def open_demos(self):
-        dialog = DemoDialog(self, self)
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
-        self._demo_dialog = dialog
-
-    def start_demo(
-        self,
-        demo_name,
-        xy_amplitude,
-        z_lift,
-        yaw_amplitude_deg,
-        linear_velocity,
-        angular_velocity,
-        repetitions,
-    ):
-        sides = self.selected_sides()
-        if not sides:
-            self.append_log("[gui] Refusing demo: no arm selected")
-            return
-        blocked = []
-        for robot, side in self.robot_arm_pairs(sides=sides):
-            status = self.arm_status.get((robot, side), "unknown")
-            if status != "armed":
-                blocked.append(f"{robot}/{SIDES[side]}={status}")
-        if blocked:
-            self.append_log(
-                "[gui] Refusing demo: press START MOTION first; " + ", ".join(blocked)
-            )
-            return
-        object_host = self.object_host()
-        process = self.processes.get(self.process_key(object_host, "demo"))
-        if process is not None and process.state() != QtCore.QProcess.NotRunning:
-            self.append_log("[gui] demo already running")
-            return
-        cmd = (
-            self.remote_setup_prefix()
-            + "exec ros2 run match_cooperative_handling virtual_object_demo_runner --ros-args "
-            + f"-p robot_name:={object_host} "
-            + f"-p world_frame:={WORLD_FRAME} "
-            + f"-p demo_name:={demo_name} "
-            + f"-p xy_amplitude:={xy_amplitude:.4f} "
-            + f"-p z_lift:={z_lift:.4f} "
-            + f"-p yaw_amplitude_deg:={yaw_amplitude_deg:.3f} "
-            + f"-p linear_velocity:={linear_velocity:.4f} "
-            + f"-p angular_velocity:={angular_velocity:.4f} "
-            + f"-p repetitions:={int(repetitions)} "
-            + "-p publish_rate_hz:=500.0"
-        )
-        self.append_log(
-            "[gui] Starting demo. The demo only publishes virtual object twist commands."
-        )
-        self.start_process(
-            self.process_key(object_host, "demo"),
-            self.remote_command(object_host, cmd),
-        )
-
-    def stop_demo(self):
-        for robot in ROBOTS:
-            process = self.processes.get(self.process_key(robot, "demo"))
-            if process is not None and process.state() != QtCore.QProcess.NotRunning:
-                self.append_log(f"[gui] stopping demo on {robot}")
-                process.terminate()
-                if not process.waitForFinished(1000):
-                    process.kill()
-        self.ros_worker.publish_object_twist([0.0] * 6)
-
-    def start_tracking_log(self):
-        sides = self.selected_sides()
-        if not sides:
-            self.append_log("[gui] Refusing tracking log: no arm selected")
-            return
-        arms = ",".join(sides)
-        for robot in self.selected_robots():
-            output_dir = os.path.join(
-                self.remote_ws(), "src", "match_cooperative_handling", "logs", "tracking"
-            )
-            cmd = (
-                self.remote_setup_prefix()
-                + "exec ros2 run match_cooperative_handling log_cooperative_tracking.py --ros-args "
-                + f"-p robot_name:={robot} "
-                + f"-p arms:={arms} "
-                + "-p duration:=300.0 "
-                + "-p sample_rate_hz:=50.0 "
-                + f"-p output_dir:={shlex.quote(output_dir)}"
-            )
-            self.append_log(f"[gui] Starting cooperative tracking logger for {robot}: {arms}")
-            self.start_process(
-                self.process_key(robot, "tracking_log"),
-                self.remote_command(robot, cmd),
-            )
-
-    def stop_tracking_log(self):
-        for robot in ROBOTS:
-            process = self.processes.get(self.process_key(robot, "tracking_log"))
-            if process is not None and process.state() != QtCore.QProcess.NotRunning:
-                self.append_log(f"[gui] stopping tracking logger on {robot}")
-                self.ros_worker.publish_tracking_stop()
-                if process.waitForFinished(2000):
-                    continue
-                process.terminate()
-                if not process.waitForFinished(1000):
-                    process.kill()
 
     def open_rviz(self):
         robot = self.object_host()
@@ -2227,13 +1749,9 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
                 "Enable it before starting hardware, or make sure MoveIt is already running."
             )
         self.append_log(
-            f"[gui] Home {prefix}: stopping virtual-object motion gate first; "
-            "START MOTION is not required for Home."
+            f"[gui] Home {prefix}: stopping module motion first."
         )
-        self.ros_worker.publish_object_twist([0.0] * 6)
-        for robot in self.selected_robots():
-            service = f"/{robot}/{prefix}/virtual_object_tcp_transform_node/stop"
-            self.ros_worker.call_trigger(service, f"disarm before home {robot}/{prefix}")
+        self.stop_module_motion_like_actions()
         QtCore.QTimer.singleShot(500, partial(self._start_home_process, side))
 
     def _start_home_process(self, side):
@@ -2241,7 +1759,7 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
         for robot in self.selected_robots():
             cmd = (
                 self.remote_setup_prefix()
-                + "exec ros2 run match_cooperative_handling move_arm_to_named_pose.py --ros-args "
+                + "exec ros2 run match_mur_gui move_arm_to_named_pose.py --ros-args "
                 + f"-p robot_name:={robot} "
                 + f"-p robot_profile:={self.robot_profile(robot)} "
                 + f"-p arm:={side} "
@@ -2254,60 +1772,9 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
                 self.remote_command(robot, cmd),
             )
 
-    def start_motion(self):
-        sides = self.selected_sides()
-        if not sides:
-            self.append_log("[gui] Refusing start: no arm selected")
-            return
-        pairs = self.robot_arm_pairs(sides=sides)
-        freedrive = [
-            f"{robot}/{SIDES[side]}"
-            for robot, side in pairs
-            if self.freedrive_active.get((robot, side), False)
-        ]
-        if freedrive:
-            self.append_log(
-                "[gui] Refusing start: disable freedrive first for " + ", ".join(freedrive)
-            )
-            return
-        self.ensure_ur_ready(
-            sides=sides,
-            robots=self.selected_robots(),
-            on_success=lambda: self._start_motion_after_ready(pairs),
-        )
-
-    def _start_motion_after_ready(self, pairs):
-        blocked = []
-        for robot, side in pairs:
-            status = self.arm_status.get((robot, side), "unknown")
-            if not (status == "ready" or status == "armed"):
-                blocked.append(f"{robot}/{SIDES[side]}={status}")
-            if not self.ur_reverse_ready.get((robot, side), False):
-                blocked.append(f"{robot}/{SIDES[side]}=UR reverse missing")
-        if blocked:
-            self.append_log("[gui] Refusing start: " + ", ".join(blocked))
-            return
-        for robot, side in pairs:
-            service = f"/{robot}/{SIDES[side]}/virtual_object_tcp_transform_node/start"
-            self.ros_worker.call_trigger(service, f"start {robot}/{SIDES[side]}")
-
-    def stop_motion(self):
-        self.stop_demo()
-        self.ros_worker.publish_object_twist([0.0] * 6)
-        robots = self.selected_robots() or ROBOTS
-        sides = self.selected_sides() or ["r", "l"]
-        for robot in robots:
-            for side in sides:
-                service = f"/{robot}/{SIDES[side]}/virtual_object_tcp_transform_node/stop"
-                self.ros_worker.call_trigger(service, f"stop {robot}/{SIDES[side]}")
-
     def stop_managed_processes(self):
-        if self.cooperative_mode:
-            self.stop_tracking_log()
-            self.stop_object_nodes(start_after_cleanup=False)
+        self.stop_module_motion_like_actions()
         cleanup_patterns = [
-            "virtual_object_demo_runner",
-            "log_cooperative_tracking.py",
             "move_arm_to_named_pose.py",
         ]
         cleanup_cmd = " ; ".join(
@@ -2335,27 +1802,14 @@ class CooperativeHandlingGui(QtWidgets.QMainWindow):
                 process.kill()
 
     def closeEvent(self, event):
-        if self.cooperative_mode:
-            self.stop_demo()
-            self.stop_motion()
         self.stop_managed_processes()
+        for module in self.modules:
+            module.on_shutdown()
         self.ros_worker.shutdown()
         self.ros_worker.wait(1500)
         super().closeEvent(event)
 
 
-class GeneralMuRGui(CooperativeHandlingGui):
+class GeneralMuRGui(MurBaseGui):
     def __init__(self):
-        super().__init__(cooperative_mode=False)
-
-
-def main():
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-    app = QtWidgets.QApplication(sys.argv)
-    window = CooperativeHandlingGui()
-    window.show()
-    sys.exit(app.exec_())
-
-
-if __name__ == "__main__":
-    main()
+        super().__init__(modules=[], window_title="General MuR GUI")
