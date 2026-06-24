@@ -634,6 +634,7 @@ class ManipulatorJogDialog(QtWidgets.QDialog):
         self.side = side
         self.mode = "translation"
         self.active = [0.0] * 6
+        self.lift_hold_direction = 0.0
         self.setWindowTitle(f"Jog {SIDES[side]} + {'right' if side == 'r' else 'left'} lift")
         self.setMinimumWidth(520)
 
@@ -709,13 +710,19 @@ class ManipulatorJogDialog(QtWidgets.QDialog):
         lift_layout.addLayout(minmax, 1, 3)
         lift_down = QtWidgets.QPushButton("Lift -")
         lift_down.setMinimumHeight(42)
-        lift_down.clicked.connect(partial(self.step_lift, -1.0))
+        lift_down.pressed.connect(partial(self.start_lift_jog, -1.0))
+        lift_down.released.connect(self.stop_lift_jog)
         lift_up = QtWidgets.QPushButton("Lift +")
         lift_up.setMinimumHeight(42)
-        lift_up.clicked.connect(partial(self.step_lift, 1.0))
+        lift_up.pressed.connect(partial(self.start_lift_jog, 1.0))
+        lift_up.released.connect(self.stop_lift_jog)
         lift_layout.addWidget(lift_down, 2, 0, 1, 2)
         lift_layout.addWidget(lift_up, 2, 2, 1, 2)
         layout.addWidget(lift_box)
+
+        self.lift_hold_timer = QtCore.QTimer(self)
+        self.lift_hold_timer.setInterval(250)
+        self.lift_hold_timer.timeout.connect(self.repeat_lift_jog)
 
         hint = QtWidgets.QLabel("Keys: arrows X/Y, PgUp/PgDn Z, M mode, Space stop")
         hint.setAlignment(QtCore.Qt.AlignCenter)
@@ -759,19 +766,46 @@ class ManipulatorJogDialog(QtWidgets.QDialog):
         self.mode_label.setText(f"Mode: {self.mode}")
         self.stop()
 
-    def step_lift(self, direction):
+    def start_lift_jog(self, direction):
+        self.lift_hold_direction = direction
+        sent = self.step_lift(direction, log_success=True)
+        if sent:
+            self.lift_hold_timer.start()
+
+    def repeat_lift_jog(self):
+        if self.lift_hold_direction == 0.0:
+            self.lift_hold_timer.stop()
+            return
+        sent = self.step_lift(self.lift_hold_direction, log_success=False)
+        if not sent:
+            self.stop_lift_jog()
+
+    def stop_lift_jog(self):
+        if self.lift_hold_direction != 0.0:
+            self.main_window.append_log(f"[gui] lift jog stopped: {self.robot_name()}/{SIDES[self.side]}")
+        self.lift_hold_direction = 0.0
+        self.lift_hold_timer.stop()
+
+    def step_lift(self, direction, log_success=True):
         current = self.ros_worker.current_lift_height(self.robot_name(), self.side)
         if current is None:
             self.main_window.append_log(
                 f"[gui] Refusing lift jog {self.robot_name()}/{SIDES[self.side]}: "
                 "no lift joint state on /joint_states"
             )
-            return
+            return False
         target = current + direction * self.lift_step.value()
         target = max(self.lift_min.value(), min(self.lift_max.value(), target))
+        if abs(target - current) < 1.0e-4:
+            self.main_window.append_log(
+                f"[gui] lift jog limit reached: {self.robot_name()}/{SIDES[self.side]} at {current:.4f} m"
+            )
+            return False
         ok, message = self.ros_worker.publish_lift_target(self.robot_name(), self.side, target)
         level = "ok" if ok else "warn"
-        self.main_window.append_log(f"[gui] lift jog {level}: {message}")
+        if log_success or not ok:
+            self.main_window.append_log(f"[gui] lift jog {level}: {message}")
+        return ok
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -808,6 +842,7 @@ class ManipulatorJogDialog(QtWidgets.QDialog):
         super().keyReleaseEvent(event)
 
     def closeEvent(self, event):
+        self.stop_lift_jog()
         self.stop()
         super().closeEvent(event)
 
