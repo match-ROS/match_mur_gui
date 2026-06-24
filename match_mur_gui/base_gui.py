@@ -19,7 +19,7 @@ from controller_manager_msgs.srv import (
 )
 from geometry_msgs.msg import TwistStamped
 from lifecycle_msgs.msg import State, TransitionEvent
-from rclpy.executors import ExternalShutdownException
+from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from sensor_msgs.msg import BatteryState, JointState
 from std_msgs.msg import Bool, Float32
 from std_srvs.srv import Trigger
@@ -34,6 +34,8 @@ HARDWARE_SCRIPT = os.path.join(
 HARDWARE_LATEST_LOG = os.path.join(
     WS, "src", "match_mobile_robotics_jazzy", "logs", "hardware", "latest.log"
 )
+GUI_LOG_DIR = os.path.join(WS, "src", "match_mur_gui", "logs", "gui")
+GUI_LATEST_LOG = os.path.join(GUI_LOG_DIR, "latest.log")
 REMOTE_HOST_SETUP_REL = os.path.join(
     "src", "match_mobile_robotics_jazzy", "setup_mur_hardware_host.sh"
 )
@@ -161,9 +163,11 @@ class RosWorker(QtCore.QThread):
         self._configure_battery_subscriptions(self.robot_names)
         self._ready.set()
         self.log.emit("[ros] GUI ROS helper started")
+        executor = SingleThreadedExecutor()
+        executor.add_node(self._node)
         try:
             while rclpy.ok() and not self._stop.is_set():
-                rclpy.spin_once(self._node, timeout_sec=0.05)
+                executor.spin_once(timeout_sec=0.05)
                 self._publish_freedrive_keepalives()
         except (KeyboardInterrupt, ExternalShutdownException):
             pass
@@ -171,8 +175,10 @@ class RosWorker(QtCore.QThread):
             if rclpy.ok():
                 self._stop_all_freedrive_keepalives()
             if self._node is not None:
+                executor.remove_node(self._node)
                 self._node.destroy_node()
                 self._node = None
+            executor.shutdown()
             if rclpy.ok():
                 rclpy.shutdown()
 
@@ -684,7 +690,7 @@ class ManipulatorJogDialog(QtWidgets.QDialog):
         self.lift_step.setRange(0.001, 0.05)
         self.lift_step.setDecimals(3)
         self.lift_step.setSingleStep(0.001)
-        self.lift_step.setValue(0.005)
+        self.lift_step.setValue(0.010)
         self.lift_min = QtWidgets.QDoubleSpinBox()
         self.lift_min.setRange(0.0, 1.0)
         self.lift_min.setDecimals(3)
@@ -916,6 +922,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.connect_status = {}
         self.connect_messages = {}
         self.battery_values = {}
+        self.gui_log_path = self._create_gui_log_file()
 
         self.ros_worker = RosWorker(["mur620d"])
         self.ros_worker.log.connect(self.append_log)
@@ -965,6 +972,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.tool_layout = tools
         root.addLayout(tools)
         tool_buttons = [self._button("Open RViz", self.open_rviz)]
+        tool_buttons.append(self._button("Save GUI Log", self.save_gui_log_snapshot))
         for button in tool_buttons:
             tools.addWidget(button)
         tools.addStretch(1)
@@ -982,7 +990,24 @@ class MurBaseGui(QtWidgets.QMainWindow):
         for module in self.modules:
             module.setup_ui(self.module_context)
 
+        self.append_log(f"[gui] Logging to {self.gui_log_path}")
         self.append_log("[gui] Ready. General MuR controls are active.")
+
+    def _create_gui_log_file(self):
+        os.makedirs(GUI_LOG_DIR, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(GUI_LOG_DIR, f"general_mur_gui_{timestamp}.log")
+        with open(path, "a", encoding="utf-8") as log_file:
+            log_file.write(f"# General MuR GUI log started {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        try:
+            tmp_link = GUI_LATEST_LOG + ".tmp"
+            if os.path.lexists(tmp_link):
+                os.unlink(tmp_link)
+            os.symlink(path, tmp_link)
+            os.replace(tmp_link, GUI_LATEST_LOG)
+        except OSError:
+            pass
+        return path
 
     def _build_robot_box(self):
         box = QtWidgets.QGroupBox("Robot")
@@ -1295,8 +1320,36 @@ class MurBaseGui(QtWidgets.QMainWindow):
             self.freedrive_button.setStyleSheet("")
 
     def append_log(self, text):
-        self.terminal.appendPlainText(text.rstrip())
-        self.terminal.verticalScrollBar().setValue(self.terminal.verticalScrollBar().maximum())
+        line = text.rstrip()
+        terminal = getattr(self, "terminal", None)
+        if terminal is not None:
+            terminal.appendPlainText(line)
+            terminal.verticalScrollBar().setValue(terminal.verticalScrollBar().maximum())
+        self._write_gui_log(line)
+
+    def _write_gui_log(self, line):
+        path = getattr(self, "gui_log_path", None)
+        if not path:
+            return
+        try:
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            with open(path, "a", encoding="utf-8") as log_file:
+                log_file.write(f"{timestamp} {line}\n")
+        except OSError:
+            pass
+
+    def save_gui_log_snapshot(self):
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        snapshot_path = os.path.join(GUI_LOG_DIR, f"general_mur_gui_snapshot_{timestamp}.log")
+        try:
+            os.makedirs(GUI_LOG_DIR, exist_ok=True)
+            with open(snapshot_path, "w", encoding="utf-8") as log_file:
+                log_file.write(self.terminal.toPlainText())
+                log_file.write("\n")
+        except OSError as exc:
+            self.append_log(f"[gui] Failed to save GUI log snapshot: {exc}")
+            return
+        self.append_log(f"[gui] Saved GUI log snapshot to {snapshot_path}")
 
     def start_process(self, name, command, env=None, on_finished=None):
         if name in self.processes and self.processes[name].state() != QtCore.QProcess.NotRunning:
@@ -1489,12 +1542,17 @@ class MurBaseGui(QtWidgets.QMainWindow):
             ur_hosts.append("UR10_l")
         if self.arm_r.isChecked():
             ur_hosts.append("UR10_r")
+        expected_reverse_ip = "192.168.12.69" if robot == "mur620d" else ""
         ur_network_prefix = ""
         if ur_hosts:
             ur_network_prefix = (
                 "export MUR_CHECK_UR_NETWORK=true; "
                 f"export MUR_UR_HOSTS={shlex.quote(' '.join(ur_hosts))}; "
             )
+            if expected_reverse_ip:
+                ur_network_prefix += (
+                    f"export MUR_EXPECTED_REVERSE_IP={shlex.quote(expected_reverse_ip)}; "
+                )
         preflight_cmd = self.remote_command(
             robot,
             ur_network_prefix
@@ -1527,6 +1585,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
         )
 
     def _launch_hardware_for_robot(self, robot):
+        expected_reverse_ip = "192.168.12.69" if robot == "mur620d" else ""
         args = [
             f"robot_name:={robot}",
             f"robot_profile:={robot}",
@@ -1559,6 +1618,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
                 "export BUILD_PACKAGES='serial ewellix_driver mur_control mur_moveit_config mur_launch_hardware match_mur_gui';",
                 f"export MUR_CHECK_UR_NETWORK={'true' if self.selected_sides() else 'false'};",
                 f"export MUR_UR_HOSTS={shlex.quote(' '.join(['UR10_l' if side == 'l' else 'UR10_r' for side in self.selected_sides()]))};",
+                f"export MUR_EXPECTED_REVERSE_IP={shlex.quote(expected_reverse_ip)};",
                 f"export INTEGRATED_CARTESIAN_ACTIVE={'true' if self.opt_integrated.isChecked() else 'false'};",
                 f"export INTEGRATED_CARTESIAN_USE_FT={'true' if self.opt_ft.isChecked() else 'false'};",
                 f"export INTEGRATED_CARTESIAN_REQUIRE_WRENCH={'true' if self.opt_require_wrench.isChecked() else 'false'};",
