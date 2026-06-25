@@ -10,6 +10,7 @@ install(PROGRAMS
   scripts/ensure_ur_ready.py
   scripts/general_mur_gui.py
   scripts/move_arm_to_named_pose.py
+  scripts/ur_dashboard_safety_check.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

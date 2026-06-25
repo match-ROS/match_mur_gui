@@ -2,6 +2,7 @@
 """Reusable PyQt base GUI for MuR robot operation."""
 
 import os
+import json
 import shlex
 import threading
 import time
@@ -41,6 +42,9 @@ REMOTE_HOST_SETUP_REL = os.path.join(
 )
 REMOTE_HOST_DIAG_REL = os.path.join(
     "src", "match_mobile_robotics_jazzy", "diagnose_mur_hardware_host.sh"
+)
+REMOTE_UR_DASHBOARD_SAFETY_CHECK_REL = os.path.join(
+    "src", "match_mur_gui", "scripts", "ur_dashboard_safety_check.py"
 )
 ROBOTS = ["mur620a", "mur620b", "mur620c", "mur620d"]
 SIDES = {"r": "UR10_r", "l": "UR10_l"}
@@ -1223,6 +1227,9 @@ class MurBaseGui(QtWidgets.QMainWindow):
     def remote_host_diag_script(self):
         return os.path.join(self.remote_ws(), REMOTE_HOST_DIAG_REL)
 
+    def remote_ur_dashboard_safety_check_script(self):
+        return os.path.join(self.remote_ws(), REMOTE_UR_DASHBOARD_SAFETY_CHECK_REL)
+
     def selected_sides(self):
         sides = []
         if self.arm_r.isChecked():
@@ -1407,6 +1414,38 @@ class MurBaseGui(QtWidgets.QMainWindow):
         )
         if on_finished is not None:
             process.finished.connect(on_finished)
+        self.processes[name] = process
+        self.append_log(f"[{name}] $ {command}")
+        process.start("bash", ["-lc", command])
+
+    def start_captured_process(self, name, command, on_finished, env=None):
+        if name in self.processes and self.processes[name].state() != QtCore.QProcess.NotRunning:
+            self.append_log(f"[gui] {name} already running")
+            return
+        process = QtCore.QProcess(self)
+        process.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+        if env:
+            qenv = QtCore.QProcessEnvironment.systemEnvironment()
+            for key, value in env.items():
+                qenv.insert(key, str(value))
+            process.setProcessEnvironment(qenv)
+        output = []
+
+        def read_output():
+            data = bytes(process.readAllStandardOutput()).decode(errors="replace")
+            output.append(data)
+            for line in data.splitlines():
+                self.append_log(f"[{name}] {line}")
+
+        process.readyReadStandardOutput.connect(read_output)
+        process.finished.connect(
+            lambda code, status: self.append_log(
+                f"[{name}] finished exit_code={code}, status={int(status)}"
+            )
+        )
+        process.finished.connect(
+            lambda code, status: on_finished(code, status, "".join(output))
+        )
         self.processes[name] = process
         self.append_log(f"[{name}] $ {command}")
         process.start("bash", ["-lc", command])
@@ -1611,11 +1650,188 @@ class MurBaseGui(QtWidgets.QMainWindow):
             self.connect_status[current_robot] = "ok"
             self.connect_messages[current_robot] = "host preflight ok for hardware start"
             self.update_connect_button()
-            self._launch_hardware_for_robot(current_robot)
+            self._check_ur_safety_before_launch(current_robot)
 
         self.start_process(
             self.process_key(robot, "hardware_preflight"),
             preflight_cmd,
+            on_finished=done,
+        )
+
+    def _selected_ur_hosts(self):
+        hosts = []
+        if self.arm_l.isChecked():
+            hosts.append("UR10_l")
+        if self.arm_r.isChecked():
+            hosts.append("UR10_r")
+        return hosts
+
+    def _ur_safety_check_command(self, robot, clear=False):
+        hosts = self._selected_ur_hosts()
+        script = self.remote_ur_dashboard_safety_check_script()
+        args = [
+            "python3",
+            shlex.quote(script),
+            "--json",
+        ]
+        if clear:
+            args.append("--clear")
+        for host in hosts:
+            args.extend(["--host", shlex.quote(host)])
+        return self.remote_command(robot, " ".join(args))
+
+    def _parse_ur_safety_payload(self, output):
+        start = output.find("{")
+        end = output.rfind("}")
+        if start < 0 or end < start:
+            raise ValueError("no JSON payload found")
+        return json.loads(output[start:end + 1])
+
+    def _format_ur_safety_payload(self, payload):
+        lines = []
+        note = payload.get("note")
+        if note:
+            lines.append(note)
+            lines.append("")
+        for arm in payload.get("arms", []):
+            host = arm.get("host", "unknown")
+            lines.append(
+                f"{host}: reachable={arm.get('reachable')} blocked={arm.get('blocked')}"
+            )
+            if arm.get("error"):
+                lines.append(f"  error: {arm['error']}")
+            if arm.get("banner"):
+                lines.append(f"  banner: {arm['banner']}")
+            for query in arm.get("queries", []):
+                lines.append(f"  {query.get('command')}: {query.get('answer')}")
+            for command in arm.get("clear", []):
+                lines.append(f"  clear {command.get('command')}: {command.get('answer')}")
+            for query in arm.get("queries_after_clear", []):
+                lines.append(
+                    f"  after clear {query.get('command')}: {query.get('answer')}"
+                )
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def _check_ur_safety_before_launch(self, robot):
+        if not self._selected_ur_hosts():
+            self._launch_hardware_for_robot(robot)
+            return
+        command = self._ur_safety_check_command(robot, clear=False)
+
+        def done(exit_code, _status, output, current_robot=robot):
+            try:
+                payload = self._parse_ur_safety_payload(output)
+            except (ValueError, json.JSONDecodeError) as exc:
+                self.append_log(
+                    f"[gui] UR safety preflight output could not be parsed: {exc}"
+                )
+                self._confirm_launch_after_safety_check_error(current_robot, output)
+                return
+
+            if exit_code == 0 and payload.get("ok", False):
+                self.append_log(f"[gui] {current_robot}: UR dashboard safety preflight ok")
+                self._launch_hardware_for_robot(current_robot)
+                return
+
+            if exit_code == 2:
+                self._show_ur_safety_blocking_dialog(current_robot, payload)
+                return
+
+            self._confirm_launch_after_safety_check_error(
+                current_robot,
+                self._format_ur_safety_payload(payload),
+            )
+
+        self.start_captured_process(
+            self.process_key(robot, "ur_safety_preflight"),
+            command,
+            on_finished=done,
+        )
+
+    def _show_ur_safety_blocking_dialog(self, robot, payload):
+        details = self._format_ur_safety_payload(payload)
+        self.append_log(f"[gui] {robot}: UR safety blocker detected before hardware launch")
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle("UR Safety Stop erkannt")
+        box.setText(
+            "Mindestens ein ausgewaehlter UR meldet einen Safety-/Protective-Stop."
+        )
+        box.setInformativeText(
+            "Fehler am Roboter pruefen. Danach kannst du die Dashboard-Fehler "
+            "quittieren und den Hardware-Start fortsetzen, oder den Start abbrechen."
+        )
+        box.setDetailedText(details)
+        clear_button = box.addButton(
+            "Fehler quittieren und starten",
+            QtWidgets.QMessageBox.AcceptRole,
+        )
+        abort_button = box.addButton(
+            "Start abbrechen",
+            QtWidgets.QMessageBox.RejectRole,
+        )
+        box.setDefaultButton(abort_button)
+        box.exec_()
+        if box.clickedButton() == clear_button:
+            self._clear_ur_safety_and_launch(robot)
+        else:
+            self.append_log(f"[gui] {robot}: hardware start aborted by user after UR safety popup")
+
+    def _confirm_launch_after_safety_check_error(self, robot, details):
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle("UR Safety Check fehlgeschlagen")
+        box.setText("Der UR-Safety-Preflight konnte nicht sauber abgeschlossen werden.")
+        box.setInformativeText(
+            "Du kannst den Hardware-Start trotzdem fortsetzen oder abbrechen."
+        )
+        box.setDetailedText(details.strip() or "No safety preflight details available.")
+        start_button = box.addButton("Trotzdem starten", QtWidgets.QMessageBox.AcceptRole)
+        abort_button = box.addButton("Start abbrechen", QtWidgets.QMessageBox.RejectRole)
+        box.setDefaultButton(abort_button)
+        box.exec_()
+        if box.clickedButton() == start_button:
+            self.append_log(
+                f"[gui] {robot}: user continued hardware start after safety check failure"
+            )
+            self._launch_hardware_for_robot(robot)
+        else:
+            self.append_log(f"[gui] {robot}: hardware start aborted after safety check failure")
+
+    def _clear_ur_safety_and_launch(self, robot):
+        command = self._ur_safety_check_command(robot, clear=True)
+
+        def done(exit_code, _status, output, current_robot=robot):
+            try:
+                payload = self._parse_ur_safety_payload(output)
+                details = self._format_ur_safety_payload(payload)
+            except (ValueError, json.JSONDecodeError) as exc:
+                details = output
+                self.append_log(
+                    f"[gui] UR safety clear output could not be parsed: {exc}"
+                )
+            if exit_code == 0:
+                self.append_log(
+                    f"[gui] {current_robot}: UR safety popups cleared; launching hardware"
+                )
+                self._launch_hardware_for_robot(current_robot)
+                return
+
+            box = QtWidgets.QMessageBox(self)
+            box.setIcon(QtWidgets.QMessageBox.Critical)
+            box.setWindowTitle("UR Safety Stop nicht quittiert")
+            box.setText("Die UR-Safety-Fehler konnten nicht vollstaendig quittiert werden.")
+            box.setInformativeText("Der Hardware-Start wurde abgebrochen.")
+            box.setDetailedText(details.strip() or "No safety clear details available.")
+            box.exec_()
+            self.append_log(
+                f"[gui] {current_robot}: hardware start aborted; UR safety clear failed"
+            )
+
+        self.start_captured_process(
+            self.process_key(robot, "ur_safety_clear"),
+            command,
             on_finished=done,
         )
 
