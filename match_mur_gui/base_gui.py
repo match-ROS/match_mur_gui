@@ -1752,28 +1752,121 @@ class MurBaseGui(QtWidgets.QMainWindow):
     def _show_ur_safety_blocking_dialog(self, robot, payload):
         details = self._format_ur_safety_payload(payload)
         self.append_log(f"[gui] {robot}: UR safety blocker detected before hardware launch")
-        box = QtWidgets.QMessageBox(self)
-        box.setIcon(QtWidgets.QMessageBox.Warning)
-        box.setWindowTitle("UR Safety Stop erkannt")
-        box.setText(
-            "Mindestens ein ausgewaehlter UR meldet einen Safety-/Protective-Stop."
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("UR Safety Stop erkannt")
+        dialog.setModal(True)
+        dialog.setMinimumSize(760, 520)
+        dialog.resize(840, 560)
+        dialog.setStyleSheet(
+            """
+            QDialog {
+                background: #fff8db;
+            }
+            QLabel#SafetyTitle {
+                color: #1f2933;
+                font-size: 22px;
+                font-weight: 700;
+            }
+            QLabel#SafetySubtitle {
+                color: #3f3f46;
+                font-size: 13px;
+            }
+            QFrame#SafetyBanner {
+                background: #facc15;
+                border: 2px solid #ca8a04;
+                border-radius: 6px;
+            }
+            QPlainTextEdit#SafetyDetails {
+                background: #111827;
+                color: #f9fafb;
+                border: 1px solid #374151;
+                border-radius: 4px;
+                font-family: monospace;
+                font-size: 12px;
+            }
+            QPushButton#SafetyClearButton {
+                background: #ca8a04;
+                color: white;
+                font-weight: 700;
+                padding: 9px 16px;
+                border-radius: 4px;
+            }
+            QPushButton#SafetyAbortButton {
+                background: #fef3c7;
+                color: #1f2933;
+                padding: 9px 16px;
+                border: 1px solid #ca8a04;
+                border-radius: 4px;
+            }
+            """
         )
-        box.setInformativeText(
-            "Fehler am Roboter pruefen. Danach kannst du die Dashboard-Fehler "
-            "quittieren und den Hardware-Start fortsetzen, oder den Start abbrechen."
+
+        root = QtWidgets.QVBoxLayout(dialog)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(14)
+
+        banner = QtWidgets.QFrame(dialog)
+        banner.setObjectName("SafetyBanner")
+        banner_layout = QtWidgets.QHBoxLayout(banner)
+        banner_layout.setContentsMargins(16, 14, 16, 14)
+        banner_layout.setSpacing(14)
+
+        icon = QtWidgets.QLabel(banner)
+        icon.setPixmap(
+            self.style().standardIcon(QtWidgets.QStyle.SP_MessageBoxWarning).pixmap(48, 48)
         )
-        box.setDetailedText(details)
-        clear_button = box.addButton(
-            "Fehler quittieren und starten",
-            QtWidgets.QMessageBox.AcceptRole,
+        banner_layout.addWidget(icon, 0, QtCore.Qt.AlignTop)
+
+        title_column = QtWidgets.QVBoxLayout()
+        title = QtWidgets.QLabel(
+            "UR Safety-/Protective-Stop erkannt",
+            banner,
         )
-        abort_button = box.addButton(
-            "Start abbrechen",
-            QtWidgets.QMessageBox.RejectRole,
+        title.setObjectName("SafetyTitle")
+        subtitle = QtWidgets.QLabel(
+            "Der Hardware-Start ist pausiert. Pruefe den Roboterbereich, "
+            "bevor du die Fehler quittierst.",
+            banner,
         )
-        box.setDefaultButton(abort_button)
-        box.exec_()
-        if box.clickedButton() == clear_button:
+        subtitle.setObjectName("SafetySubtitle")
+        subtitle.setWordWrap(True)
+        title_column.addWidget(title)
+        title_column.addWidget(subtitle)
+        banner_layout.addLayout(title_column, 1)
+        root.addWidget(banner)
+
+        instruction = QtWidgets.QLabel(
+            "Dashboard-Meldungen der ausgewaehlten URs:",
+            dialog,
+        )
+        instruction.setStyleSheet("font-weight: 700; color: #1f2933;")
+        root.addWidget(instruction)
+
+        detail_box = QtWidgets.QPlainTextEdit(dialog)
+        detail_box.setObjectName("SafetyDetails")
+        detail_box.setReadOnly(True)
+        detail_box.setPlainText(details)
+        detail_box.setMinimumHeight(260)
+        root.addWidget(detail_box, 1)
+
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.addStretch(1)
+        abort_button = QtWidgets.QPushButton("Start abbrechen", dialog)
+        abort_button.setObjectName("SafetyAbortButton")
+        clear_button = QtWidgets.QPushButton("Fehler quittieren und starten", dialog)
+        clear_button.setObjectName("SafetyClearButton")
+        button_row.addWidget(abort_button)
+        button_row.addWidget(clear_button)
+        root.addLayout(button_row)
+
+        dialog._clear_requested = False
+        clear_button.clicked.connect(lambda: setattr(dialog, "_clear_requested", True))
+        clear_button.clicked.connect(dialog.accept)
+        abort_button.clicked.connect(dialog.reject)
+        abort_button.setDefault(True)
+
+        dialog.exec_()
+        if getattr(dialog, "_clear_requested", False):
             self._clear_ur_safety_and_launch(robot)
         else:
             self.append_log(f"[gui] {robot}: hardware start aborted by user after UR safety popup")
