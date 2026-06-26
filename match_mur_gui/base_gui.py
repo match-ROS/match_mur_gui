@@ -18,13 +18,14 @@ from controller_manager_msgs.srv import (
     LoadController,
     SwitchController,
 )
-from geometry_msgs.msg import TwistStamped
+from geometry_msgs.msg import Pose, PoseStamped, TwistStamped
 from lifecycle_msgs.msg import State, TransitionEvent
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from sensor_msgs.msg import BatteryState, JointState
 from std_msgs.msg import Bool, Float32
 from std_srvs.srv import Trigger
 from ewellix_interfaces.msg import Command as EwellixCommand
+from mir_srvs.srv import ColorRGB
 
 
 WS = os.environ.get("WS", "/home/rosmatch/colcon_ws")
@@ -37,6 +38,11 @@ HARDWARE_LATEST_LOG = os.path.join(
 )
 GUI_LOG_DIR = os.path.join(WS, "src", "match_mur_gui", "logs", "gui")
 GUI_LATEST_LOG = os.path.join(GUI_LOG_DIR, "latest.log")
+MIR_POSES_FILE = os.environ.get(
+    "MIR_GUI_POSES_FILE",
+    os.path.join(WS, "src", "match_mur_gui", "config", "mir_poses.json"),
+)
+MIR_DEFAULT_NAMESPACE = os.environ.get("MIR_GUI_NAMESPACE", "")
 REMOTE_HOST_SETUP_REL = os.path.join(
     "src", "match_mobile_robotics_jazzy", "setup_mur_hardware_host.sh"
 )
@@ -78,6 +84,36 @@ def setup_prefix(ws=WS):
         "export PYTHONUNBUFFERED=1 && "
         "export RCUTILS_LOGGING_BUFFERED_STREAM=0 && "
     )
+
+
+def normalize_mir_namespace(namespace):
+    return (namespace or "").strip().strip("/")
+
+
+def ros_topic(namespace, suffix):
+    suffix = suffix.strip("/")
+    namespace = normalize_mir_namespace(namespace)
+    if namespace:
+        return f"/{namespace}/{suffix}"
+    return f"/{suffix}"
+
+
+def namespaced_frame(namespace, frame):
+    namespace = normalize_mir_namespace(namespace)
+    frame = frame.strip("/")
+    if namespace and frame != "map":
+        return f"{namespace}/{frame}"
+    return frame
+
+
+def yaw_to_quaternion(yaw):
+    return 0.0, 0.0, math.sin(yaw * 0.5), math.cos(yaw * 0.5)
+
+
+def quaternion_to_yaw(orientation):
+    siny_cosp = 2.0 * (orientation.w * orientation.z + orientation.x * orientation.y)
+    cosy_cosp = 1.0 - 2.0 * (orientation.y * orientation.y + orientation.z * orientation.z)
+    return math.atan2(siny_cosp, cosy_cosp)
 
 
 class BatteryBadge(QtWidgets.QWidget):
@@ -147,6 +183,10 @@ class RosWorker(QtCore.QThread):
         self._node = None
         self._arm_twist_pubs = {}
         self._lift_command_pubs = {}
+        self._mir_twist_pubs = {}
+        self._mir_goal_pubs = {}
+        self._mir_pose_subs = {}
+        self._mir_poses = {}
         self._joint_positions = {}
         self._joint_state_sub = None
         self._battery_subs = []
@@ -265,6 +305,100 @@ class RosWorker(QtCore.QThread):
                 self.log.emit(f"[ros] {label}: failed: {exc}")
 
         future.add_done_callback(done)
+
+    def call_color_rgb(self, service_name, red, green, blue, label):
+        if not self._ready.wait(timeout=1.0):
+            self.log.emit(f"[ros] Cannot call {label}: ROS helper not ready")
+            return
+        with self._lock:
+            client = self._node.create_client(ColorRGB, service_name)
+        if not client.wait_for_service(timeout_sec=0.5):
+            self.log.emit(f"[ros] {label}: service unavailable: {service_name}")
+            return
+        request = ColorRGB.Request()
+        request.red = int(max(0, min(255, red)))
+        request.green = int(max(0, min(255, green)))
+        request.blue = int(max(0, min(255, blue)))
+        future = client.call_async(request)
+
+        def done(done_future):
+            try:
+                result = done_future.result()
+                self.log.emit(f"[ros] {label}: success={result.success}")
+            except Exception as exc:  # noqa: BLE001
+                self.log.emit(f"[ros] {label}: failed: {exc}")
+
+        future.add_done_callback(done)
+
+    def publish_mir_twist(self, namespace, linear_x=0.0, angular_z=0.0):
+        if self._node is None:
+            return
+        topic = ros_topic(namespace, "cmd_vel_stamped")
+        with self._lock:
+            publisher = self._mir_twist_pubs.get(topic)
+            if publisher is None:
+                publisher = self._node.create_publisher(TwistStamped, topic, 10)
+                self._mir_twist_pubs[topic] = publisher
+        msg = TwistStamped()
+        msg.header.stamp = self._node.get_clock().now().to_msg()
+        msg.header.frame_id = namespaced_frame(namespace, "base_link")
+        msg.twist.linear.x = float(linear_x)
+        msg.twist.angular.z = float(angular_z)
+        publisher.publish(msg)
+
+    def publish_mir_goal(self, namespace, frame_id, x, y, yaw):
+        if self._node is None:
+            return False, "ROS helper not ready"
+        topic = ros_topic(namespace, "move_base_simple/goal")
+        with self._lock:
+            publisher = self._mir_goal_pubs.get(topic)
+            if publisher is None:
+                publisher = self._node.create_publisher(PoseStamped, topic, 10)
+                self._mir_goal_pubs[topic] = publisher
+        msg = PoseStamped()
+        msg.header.stamp = self._node.get_clock().now().to_msg()
+        msg.header.frame_id = frame_id.strip() or "map"
+        msg.pose.position.x = float(x)
+        msg.pose.position.y = float(y)
+        qx, qy, qz, qw = yaw_to_quaternion(float(yaw))
+        msg.pose.orientation.x = qx
+        msg.pose.orientation.y = qy
+        msg.pose.orientation.z = qz
+        msg.pose.orientation.w = qw
+        publisher.publish(msg)
+        if publisher.get_subscription_count() == 0:
+            return False, f"published goal on {topic}, no ROS2 subscriber discovered"
+        return True, f"published goal on {topic}: x={x:.3f}, y={y:.3f}, yaw={math.degrees(yaw):.1f} deg"
+
+    def ensure_mir_pose_subscription(self, namespace):
+        if self._node is None:
+            return
+        namespace = normalize_mir_namespace(namespace)
+        topic = ros_topic(namespace, "robot_pose")
+        with self._lock:
+            if topic in self._mir_pose_subs:
+                return
+            sub = self._node.create_subscription(
+                Pose,
+                topic,
+                partial(self._on_mir_pose, namespace),
+                10,
+            )
+            self._mir_pose_subs[topic] = sub
+
+    def _on_mir_pose(self, namespace, msg):
+        with self._lock:
+            self._mir_poses[namespace] = (
+                float(msg.position.x),
+                float(msg.position.y),
+                quaternion_to_yaw(msg.orientation),
+            )
+
+    def current_mir_pose(self, namespace):
+        namespace = normalize_mir_namespace(namespace)
+        self.ensure_mir_pose_subscription(namespace)
+        with self._lock:
+            return self._mir_poses.get(namespace)
 
     def _duration_msg(self, seconds):
         duration = SwitchController.Request().timeout
@@ -851,6 +985,393 @@ class ManipulatorJogDialog(QtWidgets.QDialog):
         super().closeEvent(event)
 
 
+
+class MiRJogDialog(QtWidgets.QDialog):
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.ros_worker = main_window.ros_worker
+        self.active_linear = 0.0
+        self.active_angular = 0.0
+        self.setWindowTitle("MiR Jog")
+        self.setMinimumWidth(420)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        namespace_row = QtWidgets.QHBoxLayout()
+        namespace_row.addWidget(QtWidgets.QLabel("Namespace"))
+        self.namespace_edit = QtWidgets.QLineEdit(MIR_DEFAULT_NAMESPACE)
+        self.namespace_edit.setPlaceholderText("leer = /cmd_vel_stamped")
+        namespace_row.addWidget(self.namespace_edit, 1)
+        layout.addLayout(namespace_row)
+
+        speed_row = QtWidgets.QHBoxLayout()
+        self.linear_speed = QtWidgets.QDoubleSpinBox()
+        self.linear_speed.setRange(0.01, 0.8)
+        self.linear_speed.setDecimals(2)
+        self.linear_speed.setSingleStep(0.01)
+        self.linear_speed.setValue(0.10)
+        self.angular_speed = QtWidgets.QDoubleSpinBox()
+        self.angular_speed.setRange(0.05, 1.5)
+        self.angular_speed.setDecimals(2)
+        self.angular_speed.setSingleStep(0.05)
+        self.angular_speed.setValue(0.30)
+        speed_row.addWidget(QtWidgets.QLabel("Linear m/s"))
+        speed_row.addWidget(self.linear_speed)
+        speed_row.addWidget(QtWidgets.QLabel("Angular rad/s"))
+        speed_row.addWidget(self.angular_speed)
+        layout.addLayout(speed_row)
+
+        grid = QtWidgets.QGridLayout()
+        self._add_button(grid, "Forward", 0, 1, 1.0, 0.0)
+        self._add_button(grid, "Turn L", 1, 0, 0.0, 1.0)
+        stop_button = QtWidgets.QPushButton("STOP")
+        stop_button.setMinimumHeight(50)
+        stop_button.clicked.connect(self.stop)
+        grid.addWidget(stop_button, 1, 1)
+        self._add_button(grid, "Turn R", 1, 2, 0.0, -1.0)
+        self._add_button(grid, "Back", 2, 1, -1.0, 0.0)
+        layout.addLayout(grid)
+
+        hint = QtWidgets.QLabel("Keys: arrows drive/turn, Space stop")
+        hint.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(hint)
+
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(50)
+
+    def namespace(self):
+        return self.namespace_edit.text().strip()
+
+    def _add_button(self, grid, text, row, column, linear_sign, angular_sign):
+        button = QtWidgets.QPushButton(text)
+        button.setMinimumHeight(50)
+        button.pressed.connect(partial(self._set_motion, linear_sign, angular_sign))
+        button.released.connect(self.stop)
+        grid.addWidget(button, row, column)
+
+    def _set_motion(self, linear_sign, angular_sign):
+        self.active_linear = float(linear_sign) * self.linear_speed.value()
+        self.active_angular = float(angular_sign) * self.angular_speed.value()
+
+    def _tick(self):
+        self.ros_worker.publish_mir_twist(
+            self.namespace(),
+            self.active_linear,
+            self.active_angular,
+        )
+
+    def stop(self):
+        self.active_linear = 0.0
+        self.active_angular = 0.0
+        for _ in range(3):
+            self.ros_worker.publish_mir_twist(self.namespace(), 0.0, 0.0)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (QtCore.Qt.Key_Space, QtCore.Qt.Key_Period):
+            self.stop()
+            return
+        mapping = {
+            QtCore.Qt.Key_Up: (1.0, 0.0),
+            QtCore.Qt.Key_Down: (-1.0, 0.0),
+            QtCore.Qt.Key_Left: (0.0, 1.0),
+            QtCore.Qt.Key_Right: (0.0, -1.0),
+        }
+        if key in mapping:
+            self._set_motion(*mapping[key])
+            return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() in (
+            QtCore.Qt.Key_Left,
+            QtCore.Qt.Key_Right,
+            QtCore.Qt.Key_Up,
+            QtCore.Qt.Key_Down,
+        ):
+            self.stop()
+            return
+        super().keyReleaseEvent(event)
+
+    def closeEvent(self, event):
+        self.stop()
+        super().closeEvent(event)
+
+
+class MiRLightDialog(QtWidgets.QDialog):
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.ros_worker = main_window.ros_worker
+        self.color = QtGui.QColor(0, 180, 255)
+        self.setWindowTitle("MiR Lights")
+        self.setMinimumWidth(440)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        namespace_row = QtWidgets.QHBoxLayout()
+        namespace_row.addWidget(QtWidgets.QLabel("Namespace"))
+        self.namespace_edit = QtWidgets.QLineEdit(MIR_DEFAULT_NAMESPACE)
+        self.namespace_edit.setPlaceholderText("leer = /RGB_control/...")
+        namespace_row.addWidget(self.namespace_edit, 1)
+        layout.addLayout(namespace_row)
+
+        trigger_box = QtWidgets.QGroupBox("Effects")
+        trigger_layout = QtWidgets.QGridLayout(trigger_box)
+        rainbow_start = QtWidgets.QPushButton("Rainbow Start")
+        rainbow_start.clicked.connect(lambda: self._trigger("rainbow_start", "MiR rainbow start"))
+        rainbow_stop = QtWidgets.QPushButton("Rainbow Stop")
+        rainbow_stop.clicked.connect(lambda: self._trigger("rainbow_stop", "MiR rainbow stop"))
+        match_color = QtWidgets.QPushButton("MATCH Color")
+        match_color.clicked.connect(lambda: self._trigger("match_color", "MiR MATCH color"))
+        trigger_layout.addWidget(rainbow_start, 0, 0)
+        trigger_layout.addWidget(rainbow_stop, 0, 1)
+        trigger_layout.addWidget(match_color, 1, 0, 1, 2)
+        layout.addWidget(trigger_box)
+
+        color_box = QtWidgets.QGroupBox("Solid Color")
+        color_layout = QtWidgets.QGridLayout(color_box)
+        self.color_button = QtWidgets.QPushButton("Choose Color")
+        self.color_button.clicked.connect(self.choose_color)
+        self.apply_button = QtWidgets.QPushButton("Apply Solid")
+        self.apply_button.clicked.connect(self.apply_solid_color)
+        self.color_preview = QtWidgets.QLabel()
+        self.color_preview.setFixedSize(48, 28)
+        self._update_preview()
+        color_layout.addWidget(self.color_preview, 0, 0)
+        color_layout.addWidget(self.color_button, 0, 1)
+        color_layout.addWidget(self.apply_button, 0, 2)
+        layout.addWidget(color_box)
+
+    def namespace(self):
+        return self.namespace_edit.text().strip()
+
+    def _service(self, name):
+        return ros_topic(self.namespace(), f"RGB_control/{name}")
+
+    def _trigger(self, service, label):
+        self.ros_worker.call_trigger(self._service(service), label)
+
+    def choose_color(self):
+        color = QtWidgets.QColorDialog.getColor(self.color, self, "MiR solid color")
+        if color.isValid():
+            self.color = color
+            self._update_preview()
+
+    def _update_preview(self):
+        self.color_preview.setStyleSheet(f"background: {self.color.name()}; border: 1px solid #4a5568;")
+        self.color_preview.setToolTip(self.color.name())
+
+    def apply_solid_color(self):
+        self.ros_worker.call_color_rgb(
+            self._service("solid_color"),
+            self.color.red(),
+            self.color.green(),
+            self.color.blue(),
+            f"MiR solid color {self.color.name()}",
+        )
+
+
+class MiRGoalDialog(QtWidgets.QDialog):
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.ros_worker = main_window.ros_worker
+        self.poses = []
+        self.setWindowTitle("MiR Goals")
+        self.setMinimumSize(620, 420)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        top = QtWidgets.QGridLayout()
+        self.namespace_edit = QtWidgets.QLineEdit(MIR_DEFAULT_NAMESPACE)
+        self.namespace_edit.setPlaceholderText("leer = /move_base_simple/goal")
+        self.namespace_edit.editingFinished.connect(self._ensure_pose_subscription)
+        self.frame_edit = QtWidgets.QLineEdit("map")
+        self.name_edit = QtWidgets.QLineEdit()
+        self.name_edit.setPlaceholderText("pose name")
+        top.addWidget(QtWidgets.QLabel("Namespace"), 0, 0)
+        top.addWidget(self.namespace_edit, 0, 1)
+        top.addWidget(QtWidgets.QLabel("Frame"), 0, 2)
+        top.addWidget(self.frame_edit, 0, 3)
+        top.addWidget(QtWidgets.QLabel("Name"), 1, 0)
+        top.addWidget(self.name_edit, 1, 1, 1, 3)
+        layout.addLayout(top)
+
+        coord_box = QtWidgets.QGroupBox("Coordinates")
+        coord_layout = QtWidgets.QGridLayout(coord_box)
+        self.x_spin = self._coord_spin(-1000.0, 1000.0, 0.0, 0.01, 3)
+        self.y_spin = self._coord_spin(-1000.0, 1000.0, 0.0, 0.01, 3)
+        self.yaw_spin = self._coord_spin(-180.0, 180.0, 0.0, 1.0, 1)
+        coord_layout.addWidget(QtWidgets.QLabel("X [m]"), 0, 0)
+        coord_layout.addWidget(self.x_spin, 0, 1)
+        coord_layout.addWidget(QtWidgets.QLabel("Y [m]"), 0, 2)
+        coord_layout.addWidget(self.y_spin, 0, 3)
+        coord_layout.addWidget(QtWidgets.QLabel("Yaw [deg]"), 0, 4)
+        coord_layout.addWidget(self.yaw_spin, 0, 5)
+        send_coords = QtWidgets.QPushButton("Drive Coordinates")
+        send_coords.clicked.connect(self.send_current_fields)
+        save_coords = QtWidgets.QPushButton("Save Coordinates")
+        save_coords.clicked.connect(self.save_fields)
+        save_robot = QtWidgets.QPushButton("Save Current Robot Pose")
+        save_robot.clicked.connect(self.save_robot_pose)
+        coord_layout.addWidget(send_coords, 1, 0, 1, 2)
+        coord_layout.addWidget(save_coords, 1, 2, 1, 2)
+        coord_layout.addWidget(save_robot, 1, 4, 1, 2)
+        layout.addWidget(coord_box)
+
+        saved_box = QtWidgets.QGroupBox("Saved Poses")
+        saved_layout = QtWidgets.QGridLayout(saved_box)
+        self.pose_list = QtWidgets.QListWidget()
+        self.pose_list.currentRowChanged.connect(self._load_selected_into_fields)
+        saved_layout.addWidget(self.pose_list, 0, 0, 1, 4)
+        drive_selected = QtWidgets.QPushButton("Drive Selected")
+        drive_selected.clicked.connect(self.send_selected)
+        delete_selected = QtWidgets.QPushButton("Delete Selected")
+        delete_selected.clicked.connect(self.delete_selected)
+        reload_button = QtWidgets.QPushButton("Reload")
+        reload_button.clicked.connect(self.reload_poses)
+        saved_layout.addWidget(drive_selected, 1, 0)
+        saved_layout.addWidget(delete_selected, 1, 1)
+        saved_layout.addWidget(reload_button, 1, 2)
+        layout.addWidget(saved_box, 1)
+
+        self.reload_poses()
+        self._ensure_pose_subscription()
+
+    def _coord_spin(self, minimum, maximum, value, step, decimals):
+        spin = QtWidgets.QDoubleSpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setValue(value)
+        spin.setSingleStep(step)
+        spin.setDecimals(decimals)
+        return spin
+
+    def namespace(self):
+        return self.namespace_edit.text().strip()
+
+    def frame_id(self):
+        return self.frame_edit.text().strip() or "map"
+
+    def _ensure_pose_subscription(self):
+        self.ros_worker.ensure_mir_pose_subscription(self.namespace())
+
+    def reload_poses(self):
+        self.poses = []
+        try:
+            with open(MIR_POSES_FILE, "r", encoding="utf-8") as pose_file:
+                payload = json.load(pose_file)
+        except FileNotFoundError:
+            payload = {"poses": []}
+        except (OSError, json.JSONDecodeError) as exc:
+            self.main_window.append_log(f"[gui] Failed to load MiR poses from {MIR_POSES_FILE}: {exc}")
+            payload = {"poses": []}
+        if isinstance(payload, list):
+            self.poses = payload
+        else:
+            self.poses = list(payload.get("poses", []))
+        self._refresh_pose_list()
+
+    def _write_poses(self):
+        try:
+            os.makedirs(os.path.dirname(MIR_POSES_FILE), exist_ok=True)
+            with open(MIR_POSES_FILE, "w", encoding="utf-8") as pose_file:
+                json.dump({"poses": self.poses}, pose_file, indent=2, sort_keys=True)
+                pose_file.write("\n")
+        except OSError as exc:
+            self.main_window.append_log(f"[gui] Failed to write MiR poses to {MIR_POSES_FILE}: {exc}")
+            return False
+        self.main_window.append_log(f"[gui] Saved MiR poses to {MIR_POSES_FILE}")
+        return True
+
+    def _refresh_pose_list(self):
+        self.pose_list.clear()
+        for pose in self.poses:
+            name = pose.get("name", "unnamed")
+            frame = pose.get("frame_id", "map")
+            self.pose_list.addItem(f"{name}  ({frame}: {pose.get('x', 0.0):.3f}, {pose.get('y', 0.0):.3f}, {pose.get('yaw_deg', 0.0):.1f} deg)")
+
+    def _selected_pose(self):
+        row = self.pose_list.currentRow()
+        if row < 0 or row >= len(self.poses):
+            return None
+        return self.poses[row]
+
+    def _load_selected_into_fields(self):
+        pose = self._selected_pose()
+        if pose is None:
+            return
+        self.name_edit.setText(pose.get("name", ""))
+        self.frame_edit.setText(pose.get("frame_id", "map"))
+        self.x_spin.setValue(float(pose.get("x", 0.0)))
+        self.y_spin.setValue(float(pose.get("y", 0.0)))
+        self.yaw_spin.setValue(float(pose.get("yaw_deg", 0.0)))
+
+    def _pose_from_fields(self):
+        return {
+            "name": self.name_edit.text().strip() or time.strftime("pose_%Y%m%d_%H%M%S"),
+            "frame_id": self.frame_id(),
+            "x": float(self.x_spin.value()),
+            "y": float(self.y_spin.value()),
+            "yaw_deg": float(self.yaw_spin.value()),
+        }
+
+    def _upsert_pose(self, pose):
+        for index, existing in enumerate(self.poses):
+            if existing.get("name") == pose["name"]:
+                self.poses[index] = pose
+                break
+        else:
+            self.poses.append(pose)
+        if self._write_poses():
+            self._refresh_pose_list()
+
+    def save_fields(self):
+        self._upsert_pose(self._pose_from_fields())
+
+    def save_robot_pose(self):
+        self._ensure_pose_subscription()
+        pose = self.ros_worker.current_mir_pose(self.namespace())
+        if pose is None:
+            self.main_window.append_log(f"[gui] No MiR robot_pose received on {ros_topic(self.namespace(), 'robot_pose')}")
+            return
+        x, y, yaw = pose
+        self.x_spin.setValue(x)
+        self.y_spin.setValue(y)
+        self.yaw_spin.setValue(math.degrees(yaw))
+        self._upsert_pose(self._pose_from_fields())
+
+    def _send_pose(self, pose):
+        yaw = math.radians(float(pose.get("yaw_deg", 0.0)))
+        ok, message = self.ros_worker.publish_mir_goal(
+            self.namespace(),
+            pose.get("frame_id", "map"),
+            float(pose.get("x", 0.0)),
+            float(pose.get("y", 0.0)),
+            yaw,
+        )
+        level = "ok" if ok else "warn"
+        self.main_window.append_log(f"[gui] MiR goal {level}: {message}")
+
+    def send_current_fields(self):
+        self._send_pose(self._pose_from_fields())
+
+    def send_selected(self):
+        pose = self._selected_pose()
+        if pose is None:
+            self.main_window.append_log("[gui] No saved MiR pose selected")
+            return
+        self._send_pose(pose)
+
+    def delete_selected(self):
+        row = self.pose_list.currentRow()
+        if row < 0 or row >= len(self.poses):
+            return
+        removed = self.poses.pop(row)
+        if self._write_poses():
+            self._refresh_pose_list()
+            self.main_window.append_log(f"[gui] Deleted MiR pose {removed.get('name', 'unnamed')}")
+
+
 class MurGuiModule:
     """Base class for externally provided GUI modules."""
 
@@ -922,11 +1443,11 @@ class MurGuiContext:
     def ur_reverse_ready(self, robot, side):
         return self.window.ur_reverse_ready.get((robot, side), False)
 
-    def add_action_button(self, text, callback):
-        return self.window.add_action_button(text, callback)
+    def add_action_button(self, text, callback, section="Tools"):
+        return self.window.add_action_button(text, callback, section=section)
 
-    def add_tool_button(self, text, callback):
-        return self.window.add_tool_button(text, callback)
+    def add_tool_button(self, text, callback, section="Tools"):
+        return self.window.add_tool_button(text, callback, section=section)
 
     def add_bottom_widget(self, widget):
         self.window.bottom_layout.addWidget(widget)
@@ -979,42 +1500,36 @@ class MurBaseGui(QtWidgets.QMainWindow):
         top.addWidget(self._build_options_box(), 1)
         top.addWidget(self._build_status_box())
 
-        actions = QtWidgets.QHBoxLayout()
-        self.action_layout = actions
-        root.addLayout(actions)
-        action_buttons = [
-            self._button("Connect", self.connect_selected_robots),
-            self._button("Check Host", self.check_selected_hosts),
-            self._button("Start Hardware", self.start_hardware),
-            self._button("Enable URs / Ready", self.ensure_ur_ready),
-        ]
-        action_buttons.extend([
-            self._button("Home L", partial(self.move_home, "l")),
-            self._button("Home R", partial(self.move_home, "r")),
-            self._button("Jog L", partial(self.open_manipulator_jog, "l")),
-            self._button("Jog R", partial(self.open_manipulator_jog, "r")),
-        ])
-        action_buttons.extend([
-            self._button("Freedrive", self.toggle_freedrive),
-            self._button("Stop Managed Processes", self.stop_managed_processes),
-        ])
-        for button in action_buttons:
-            actions.addWidget(button)
-            if button.text() == "Connect":
-                self.connect_button = button
-                self.update_connect_button()
-            if button.text() == "Freedrive":
-                self.freedrive_button = button
-                self.update_freedrive_button()
+        self.section_container = QtWidgets.QWidget()
+        self.section_layout = QtWidgets.QGridLayout(self.section_container)
+        self.section_layout.setContentsMargins(0, 0, 0, 0)
+        self.section_layout.setHorizontalSpacing(10)
+        self.section_layout.setVerticalSpacing(8)
+        self._sections = {}
+        root.addWidget(self.section_container)
 
-        tools = QtWidgets.QHBoxLayout()
-        self.tool_layout = tools
-        root.addLayout(tools)
-        tool_buttons = [self._button("Open RViz", self.open_rviz)]
-        tool_buttons.append(self._button("Save GUI Log", self.save_gui_log_snapshot))
-        for button in tool_buttons:
-            tools.addWidget(button)
-        tools.addStretch(1)
+        general_buttons = [
+            self.add_action_button("Connect", self.connect_selected_robots, section="General"),
+            self.add_action_button("Check Host", self.check_selected_hosts, section="General"),
+            self.add_action_button("Start Hardware", self.start_hardware, section="General"),
+            self.add_action_button("Open RViz", self.open_rviz, section="General"),
+            self.add_action_button("Save GUI Log", self.save_gui_log_snapshot, section="General"),
+            self.add_action_button("Stop Managed Processes", self.stop_managed_processes, section="General"),
+        ]
+        self.connect_button = general_buttons[0]
+        self.update_connect_button()
+
+        self.add_action_button("MiR Jog", self.open_mir_jog, section="MiR")
+        self.add_action_button("MiR Lights", self.open_mir_lights, section="MiR")
+        self.add_action_button("MiR Goals", self.open_mir_goals, section="MiR")
+
+        self.add_action_button("Enable URs / Ready", self.ensure_ur_ready, section="UR")
+        self.add_action_button("Home L", partial(self.move_home, "l"), section="UR")
+        self.add_action_button("Home R", partial(self.move_home, "r"), section="UR")
+        self.add_action_button("Jog L", partial(self.open_manipulator_jog, "l"), section="UR")
+        self.add_action_button("Jog R", partial(self.open_manipulator_jog, "r"), section="UR")
+        self.freedrive_button = self.add_action_button("Freedrive", self.toggle_freedrive, section="UR")
+        self.update_freedrive_button()
 
         self.terminal = QtWidgets.QPlainTextEdit()
         self.terminal.setReadOnly(True)
@@ -1155,16 +1670,35 @@ class MurBaseGui(QtWidgets.QMainWindow):
         button.clicked.connect(callback)
         return button
 
-    def add_action_button(self, text, callback):
-        button = self._button(text, callback)
-        self.action_layout.addWidget(button)
+    def _section_state(self, title):
+        title = title or "Tools"
+        state = self._sections.get(title)
+        if state is not None:
+            return state
+        box = QtWidgets.QGroupBox(title)
+        layout = QtWidgets.QGridLayout(box)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setHorizontalSpacing(6)
+        layout.setVerticalSpacing(6)
+        index = len(self._sections)
+        self.section_layout.addWidget(box, index // 4, index % 4)
+        self.section_layout.setColumnStretch(index % 4, 1)
+        state = {"box": box, "layout": layout, "count": 0}
+        self._sections[title] = state
+        return state
+
+    def _add_button_to_section(self, button, section):
+        state = self._section_state(section)
+        count = state["count"]
+        state["layout"].addWidget(button, count // 2, count % 2)
+        state["count"] = count + 1
         return button
 
-    def add_tool_button(self, text, callback):
-        button = self._button(text, callback)
-        index = max(0, self.tool_layout.count() - 1)
-        self.tool_layout.insertWidget(index, button)
-        return button
+    def add_action_button(self, text, callback, section="Tools"):
+        return self._add_button_to_section(self._button(text, callback), section)
+
+    def add_tool_button(self, text, callback, section="Tools"):
+        return self.add_action_button(text, callback, section=section)
 
     def update_moveit_speed_label(self, value):
         self.moveit_speed_label.setText(f"MoveIt speed: {value}%")
@@ -2094,6 +2628,27 @@ class MurBaseGui(QtWidgets.QMainWindow):
         dialog.raise_()
         dialog.activateWindow()
         self._manipulator_jog_dialog = dialog
+
+    def open_mir_jog(self):
+        dialog = MiRJogDialog(self, self)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self._mir_jog_dialog = dialog
+
+    def open_mir_lights(self):
+        dialog = MiRLightDialog(self, self)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self._mir_light_dialog = dialog
+
+    def open_mir_goals(self):
+        dialog = MiRGoalDialog(self, self)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self._mir_goal_dialog = dialog
 
     def stop_module_motion_like_actions(self):
         for module in self.modules:
