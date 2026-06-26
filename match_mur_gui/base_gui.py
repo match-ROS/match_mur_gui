@@ -1601,8 +1601,12 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.arm_l = QtWidgets.QCheckBox("UR10_l")
         self.arm_l.setChecked(True)
         self.arm_l.toggled.connect(lambda _checked: self.update_freedrive_button())
+        self.mir_enabled_check = QtWidgets.QCheckBox("mir")
+        self.mir_enabled_check.setChecked(False)
+        self.mir_enabled_check.setToolTip("Startet den MiR ROS2/ROS1 Bridge-Treiber beim Hardware-Start")
         layout.addRow(self.arm_r)
         layout.addRow(self.arm_l)
+        layout.addRow(self.mir_enabled_check)
         return box
 
     def _build_options_box(self):
@@ -1771,6 +1775,9 @@ class MurBaseGui(QtWidgets.QMainWindow):
         if self.arm_l.isChecked():
             sides.append("l")
         return sides
+
+    def launch_mir_enabled(self):
+        return getattr(self, "mir_enabled_check", None) is not None and self.mir_enabled_check.isChecked()
 
     def fallback_motion_controller(self):
         if self.opt_integrated.isChecked():
@@ -2469,6 +2476,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
             f"robot_profile:={robot}",
             f"launch_ur_r:={'true' if self.arm_r.isChecked() else 'false'}",
             f"launch_ur_l:={'true' if self.arm_l.isChecked() else 'false'}",
+            f"launch_mir:={'true' if self.launch_mir_enabled() else 'false'}",
             f"integrated_controller_enable_collision_avoidance:={'true' if self.opt_collision.isChecked() else 'false'}",
             f"integrated_controller_publish_collision_markers:={'true' if self.opt_markers.isChecked() else 'false'}",
             f"launch_moveit:={'true' if self.opt_moveit.isChecked() else 'false'}",
@@ -2493,7 +2501,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
                 f"export ROS_DOMAIN_ID={shlex.quote(os.environ.get('ROS_DOMAIN_ID', '62'))};",
                 f"export ROBOT_PROFILE={shlex.quote(robot)};",
                 f"export BUILD_BEFORE_LAUNCH={'true' if self.opt_build.isChecked() else 'false'};",
-                "export BUILD_PACKAGES='serial ewellix_driver mur_control mur_moveit_config mur_launch_hardware match_mur_gui';",
+                "export BUILD_PACKAGES='serial ewellix_driver mur_control mur_moveit_config mur_launch_hardware match_mur_gui mir_launch_hardware mir_driver mir_msgs mir_srvs mir_restapi sdc21x0';",
                 f"export MUR_CHECK_UR_NETWORK={'true' if self.selected_sides() else 'false'};",
                 f"export MUR_UR_HOSTS={shlex.quote(' '.join(['UR10_l' if side == 'l' else 'UR10_r' for side in self.selected_sides()]))};",
                 f"export MUR_EXPECTED_REVERSE_IP={shlex.quote(expected_reverse_ip)};",
