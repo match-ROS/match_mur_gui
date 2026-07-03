@@ -3,6 +3,7 @@
 
 import os
 import json
+import re
 import shlex
 import threading
 import time
@@ -18,7 +19,7 @@ from controller_manager_msgs.srv import (
     LoadController,
     SwitchController,
 )
-from geometry_msgs.msg import Pose, PoseStamped, TwistStamped
+from geometry_msgs.msg import Pose, PoseStamped, Twist, TwistStamped
 from lifecycle_msgs.msg import State, TransitionEvent
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from sensor_msgs.msg import BatteryState, JointState
@@ -73,6 +74,15 @@ MOTION_CONTROLLERS = [
     "tool_contact_controller",
     FREEDRIVE_CONTROLLER,
 ]
+LOG_LEVELS = ("error", "warning", "info")
+ERROR_LOG_RE = re.compile(
+    r"\[(error|fatal)\]|"
+    r"\b(error|failed|failure|exception|traceback|could not)\b"
+)
+WARNING_LOG_RE = re.compile(
+    r"\[(warn|warning)\]|"
+    r"\b(warning|warn|refusing|aborted|unavailable|timeout|timed out)\b"
+)
 
 
 def setup_prefix(ws=WS):
@@ -104,6 +114,20 @@ def namespaced_frame(namespace, frame):
     if namespace and frame != "map":
         return f"{namespace}/{frame}"
     return frame
+
+
+def namespace_from_ros_name(name, suffixes):
+    name = (name or "").strip("/")
+    if not name:
+        return None
+    for suffix in suffixes:
+        suffix = suffix.strip("/")
+        if name == suffix:
+            return ""
+        marker = "/" + suffix
+        if name.endswith(marker):
+            return name[: -len(marker)].strip("/")
+    return None
 
 
 def yaw_to_quaternion(yaw):
@@ -187,6 +211,7 @@ class RosWorker(QtCore.QThread):
         self._mir_goal_pubs = {}
         self._mir_pose_subs = {}
         self._mir_poses = {}
+        self._mir_twist_last_warn = {}
         self._joint_positions = {}
         self._joint_state_sub = None
         self._battery_subs = []
@@ -333,18 +358,100 @@ class RosWorker(QtCore.QThread):
     def publish_mir_twist(self, namespace, linear_x=0.0, angular_z=0.0):
         if self._node is None:
             return
-        topic = ros_topic(namespace, "cmd_vel_stamped")
+        namespace = normalize_mir_namespace(namespace)
+        linear_x = float(linear_x)
+        angular_z = float(angular_z)
+        cmd_vel_topic = ros_topic(namespace, "cmd_vel")
+        stamped_topic = ros_topic(namespace, "cmd_vel_stamped")
+
+        use_plain_twist = self._topic_has_subscription(cmd_vel_topic, "geometry_msgs/msg/Twist")
+        use_stamped_twist = self._topic_has_subscription(
+            stamped_topic,
+            "geometry_msgs/msg/TwistStamped",
+        )
+        if use_plain_twist:
+            self._publish_mir_plain_twist(cmd_vel_topic, linear_x, angular_z)
+            return
+        self._publish_mir_stamped_twist(stamped_topic, namespace, linear_x, angular_z)
+        if not use_stamped_twist and (abs(linear_x) > 1e-6 or abs(angular_z) > 1e-6):
+            now = time.monotonic()
+            last_warn = self._mir_twist_last_warn.get(namespace, 0.0)
+            if now - last_warn > 2.0:
+                self._mir_twist_last_warn[namespace] = now
+                self.log.emit(
+                    "[ros] MiR jog: no subscriber discovered on "
+                    f"{cmd_vel_topic} [Twist] or {stamped_topic} [TwistStamped]"
+                )
+
+    def _topic_has_subscription(self, topic, topic_type):
+        try:
+            infos = self._node.get_subscriptions_info_by_topic(topic)
+        except Exception:  # noqa: BLE001
+            return False
+        return any(getattr(info, "topic_type", "") == topic_type for info in infos)
+
+    def _publish_mir_plain_twist(self, topic, linear_x, angular_z):
         with self._lock:
-            publisher = self._mir_twist_pubs.get(topic)
+            publisher = self._mir_twist_pubs.get((topic, "twist"))
+            if publisher is None:
+                publisher = self._node.create_publisher(Twist, topic, 10)
+                self._mir_twist_pubs[(topic, "twist")] = publisher
+        msg = Twist()
+        msg.linear.x = linear_x
+        msg.angular.z = angular_z
+        publisher.publish(msg)
+
+    def _publish_mir_stamped_twist(self, topic, namespace, linear_x, angular_z):
+        with self._lock:
+            publisher = self._mir_twist_pubs.get((topic, "twist_stamped"))
             if publisher is None:
                 publisher = self._node.create_publisher(TwistStamped, topic, 10)
-                self._mir_twist_pubs[topic] = publisher
+                self._mir_twist_pubs[(topic, "twist_stamped")] = publisher
         msg = TwistStamped()
         msg.header.stamp = self._node.get_clock().now().to_msg()
         msg.header.frame_id = namespaced_frame(namespace, "base_link")
-        msg.twist.linear.x = float(linear_x)
-        msg.twist.angular.z = float(angular_z)
+        msg.twist.linear.x = linear_x
+        msg.twist.angular.z = angular_z
         publisher.publish(msg)
+
+    def discover_mir_namespaces(self):
+        if not self._ready.wait(timeout=1.0) or self._node is None:
+            return []
+
+        topic_suffixes = {
+            "cmd_vel",
+            "cmd_vel_stamped",
+            "robot_pose",
+            "scan",
+            "f_scan",
+            "b_scan",
+            "f_raw_scan",
+            "b_raw_scan",
+        }
+        service_suffixes = {
+            "RGB_control/rainbow_start",
+            "RGB_control/rainbow_stop",
+            "RGB_control/match_color",
+            "RGB_control/solid_color",
+        }
+        namespaces = set()
+        with self._lock:
+            try:
+                topics = self._node.get_topic_names_and_types()
+                services = self._node.get_service_names_and_types()
+            except Exception as exc:  # noqa: BLE001
+                self.log.emit(f"[ros] MiR namespace discovery failed: {exc}")
+                return []
+
+        for name, _types in topics:
+            namespace = namespace_from_ros_name(name, topic_suffixes)
+            if namespace is not None:
+                namespaces.add(namespace)
+        for name, _types in services:
+            namespace = namespace_from_ros_name(name, service_suffixes)
+            if namespace is not None:
+                namespaces.add(namespace)
+        return sorted(namespaces)
 
     def publish_mir_goal(self, namespace, frame_id, x, y, yaw):
         if self._node is None:
@@ -985,6 +1092,49 @@ class ManipulatorJogDialog(QtWidgets.QDialog):
         super().closeEvent(event)
 
 
+def populate_mir_namespace_combo(combo, main_window, keep_current=True):
+    current = combo.currentText().strip() if keep_current else ""
+    choices = []
+
+    def add_choice(value):
+        value = normalize_mir_namespace(value)
+        if value not in choices:
+            choices.append(value)
+
+    add_choice(current)
+    add_choice(MIR_DEFAULT_NAMESPACE)
+    for namespace in main_window.ros_worker.discover_mir_namespaces():
+        add_choice(namespace)
+    for robot in main_window.selected_robots():
+        add_choice(robot)
+
+    choices = [choice for choice in choices if choice]
+    if not choices:
+        choices = ["mur620d"]
+
+    target = normalize_mir_namespace(current or MIR_DEFAULT_NAMESPACE or choices[0])
+    if target not in choices:
+        choices.insert(0, target)
+
+    combo.blockSignals(True)
+    combo.clear()
+    combo.addItems(choices)
+    combo.setCurrentText(target)
+    combo.blockSignals(False)
+    return choices
+
+
+def create_mir_namespace_combo(main_window, placeholder):
+    combo = QtWidgets.QComboBox()
+    combo.setEditable(True)
+    combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+    combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+    if combo.lineEdit() is not None:
+        combo.lineEdit().setPlaceholderText(placeholder)
+    populate_mir_namespace_combo(combo, main_window, keep_current=False)
+    return combo
+
+
 
 class MiRJogDialog(QtWidgets.QDialog):
     def __init__(self, main_window, parent=None):
@@ -998,10 +1148,14 @@ class MiRJogDialog(QtWidgets.QDialog):
 
         layout = QtWidgets.QVBoxLayout(self)
         namespace_row = QtWidgets.QHBoxLayout()
-        namespace_row.addWidget(QtWidgets.QLabel("Namespace"))
-        self.namespace_edit = QtWidgets.QLineEdit(MIR_DEFAULT_NAMESPACE)
-        self.namespace_edit.setPlaceholderText("leer = /cmd_vel_stamped")
-        namespace_row.addWidget(self.namespace_edit, 1)
+        namespace_row.addWidget(QtWidgets.QLabel("MiR"))
+        self.namespace_combo = create_mir_namespace_combo(main_window, "z.B. mur620d")
+        namespace_row.addWidget(self.namespace_combo, 1)
+        refresh_namespaces = QtWidgets.QPushButton("Refresh")
+        refresh_namespaces.clicked.connect(
+            lambda: populate_mir_namespace_combo(self.namespace_combo, self.main_window)
+        )
+        namespace_row.addWidget(refresh_namespaces)
         layout.addLayout(namespace_row)
 
         speed_row = QtWidgets.QHBoxLayout()
@@ -1041,7 +1195,7 @@ class MiRJogDialog(QtWidgets.QDialog):
         self.timer.start(50)
 
     def namespace(self):
-        return self.namespace_edit.text().strip()
+        return self.namespace_combo.currentText().strip()
 
     def _add_button(self, grid, text, row, column, linear_sign, angular_sign):
         button = QtWidgets.QPushButton(text)
@@ -1110,10 +1264,14 @@ class MiRLightDialog(QtWidgets.QDialog):
 
         layout = QtWidgets.QVBoxLayout(self)
         namespace_row = QtWidgets.QHBoxLayout()
-        namespace_row.addWidget(QtWidgets.QLabel("Namespace"))
-        self.namespace_edit = QtWidgets.QLineEdit(MIR_DEFAULT_NAMESPACE)
-        self.namespace_edit.setPlaceholderText("leer = /RGB_control/...")
-        namespace_row.addWidget(self.namespace_edit, 1)
+        namespace_row.addWidget(QtWidgets.QLabel("MiR"))
+        self.namespace_combo = create_mir_namespace_combo(main_window, "z.B. mur620d")
+        namespace_row.addWidget(self.namespace_combo, 1)
+        refresh_namespaces = QtWidgets.QPushButton("Refresh")
+        refresh_namespaces.clicked.connect(
+            lambda: populate_mir_namespace_combo(self.namespace_combo, self.main_window)
+        )
+        namespace_row.addWidget(refresh_namespaces)
         layout.addLayout(namespace_row)
 
         trigger_box = QtWidgets.QGroupBox("Effects")
@@ -1144,7 +1302,7 @@ class MiRLightDialog(QtWidgets.QDialog):
         layout.addWidget(color_box)
 
     def namespace(self):
-        return self.namespace_edit.text().strip()
+        return self.namespace_combo.currentText().strip()
 
     def _service(self, name):
         return ros_topic(self.namespace(), f"RGB_control/{name}")
@@ -1183,14 +1341,22 @@ class MiRGoalDialog(QtWidgets.QDialog):
 
         layout = QtWidgets.QVBoxLayout(self)
         top = QtWidgets.QGridLayout()
-        self.namespace_edit = QtWidgets.QLineEdit(MIR_DEFAULT_NAMESPACE)
-        self.namespace_edit.setPlaceholderText("leer = /move_base_simple/goal")
-        self.namespace_edit.editingFinished.connect(self._ensure_pose_subscription)
+        self.namespace_combo = create_mir_namespace_combo(main_window, "z.B. mur620d")
+        self.namespace_combo.currentTextChanged.connect(lambda _text: self._ensure_pose_subscription())
+        if self.namespace_combo.lineEdit() is not None:
+            self.namespace_combo.lineEdit().editingFinished.connect(self._ensure_pose_subscription)
         self.frame_edit = QtWidgets.QLineEdit("map")
         self.name_edit = QtWidgets.QLineEdit()
         self.name_edit.setPlaceholderText("pose name")
-        top.addWidget(QtWidgets.QLabel("Namespace"), 0, 0)
-        top.addWidget(self.namespace_edit, 0, 1)
+        top.addWidget(QtWidgets.QLabel("MiR"), 0, 0)
+        namespace_cell = QtWidgets.QHBoxLayout()
+        namespace_cell.addWidget(self.namespace_combo, 1)
+        refresh_namespaces = QtWidgets.QPushButton("Refresh")
+        refresh_namespaces.clicked.connect(
+            lambda: populate_mir_namespace_combo(self.namespace_combo, self.main_window)
+        )
+        namespace_cell.addWidget(refresh_namespaces)
+        top.addLayout(namespace_cell, 0, 1)
         top.addWidget(QtWidgets.QLabel("Frame"), 0, 2)
         top.addWidget(self.frame_edit, 0, 3)
         top.addWidget(QtWidgets.QLabel("Name"), 1, 0)
@@ -1247,7 +1413,7 @@ class MiRGoalDialog(QtWidgets.QDialog):
         return spin
 
     def namespace(self):
-        return self.namespace_edit.text().strip()
+        return self.namespace_combo.currentText().strip()
 
     def frame_id(self):
         return self.frame_edit.text().strip() or "map"
@@ -1482,6 +1648,9 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.connect_status = {}
         self.connect_messages = {}
         self.battery_values = {}
+        self.log_entries = []
+        self.log_filters = {level: True for level in LOG_LEVELS}
+        self.log_filter_buttons = {}
         self.gui_log_path = self._create_gui_log_file()
 
         self.ros_worker = RosWorker(["mur620d"])
@@ -1539,6 +1708,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
 
         self.bottom_layout = QtWidgets.QHBoxLayout()
         root.addLayout(self.bottom_layout)
+        self._build_log_filter_controls()
         self.bottom_layout.addStretch(1)
 
         for module in self.modules:
@@ -1673,6 +1843,28 @@ class MurBaseGui(QtWidgets.QMainWindow):
         button = QtWidgets.QPushButton(text)
         button.clicked.connect(callback)
         return button
+
+    def _build_log_filter_controls(self):
+        label = QtWidgets.QLabel("Log Filter:")
+        self.bottom_layout.addWidget(label)
+
+        filter_specs = [
+            ("error", "Errors", "#c53030"),
+            ("warning", "Warnings", "#d69e2e"),
+            ("info", "Infos", "#2b6cb0"),
+        ]
+        for level, text, color in filter_specs:
+            button = QtWidgets.QPushButton(text)
+            button.setCheckable(True)
+            button.setChecked(True)
+            button.setToolTip(f"{text} im GUI-Log anzeigen/ausblenden")
+            button.toggled.connect(partial(self.set_log_filter, level))
+            button.setStyleSheet(
+                "QPushButton { padding: 4px 10px; }"
+                f"QPushButton:checked {{ background: {color}; color: white; font-weight: bold; }}"
+            )
+            self.log_filter_buttons[level] = button
+            self.bottom_layout.addWidget(button)
 
     def _section_state(self, title):
         title = title or "Tools"
@@ -1904,11 +2096,46 @@ class MurBaseGui(QtWidgets.QMainWindow):
 
     def append_log(self, text):
         line = text.rstrip()
+        level = self._log_level(line)
+        self.log_entries.append((level, line))
         terminal = getattr(self, "terminal", None)
-        if terminal is not None:
+        if terminal is not None and self.log_filters.get(level, True):
             terminal.appendPlainText(line)
             terminal.verticalScrollBar().setValue(terminal.verticalScrollBar().maximum())
         self._write_gui_log(line)
+
+    def _log_level(self, line):
+        lower = line.lower()
+        if ERROR_LOG_RE.search(lower):
+            return "error"
+        if WARNING_LOG_RE.search(lower):
+            return "warning"
+        return "info"
+
+    def set_log_filter(self, level, enabled):
+        if level not in self.log_filters:
+            return
+        self.log_filters[level] = enabled
+        self.refresh_gui_log()
+
+    def refresh_gui_log(self):
+        terminal = getattr(self, "terminal", None)
+        if terminal is None:
+            return
+        scroll_bar = terminal.verticalScrollBar()
+        was_at_bottom = scroll_bar.value() == scroll_bar.maximum()
+        terminal.setUpdatesEnabled(False)
+        terminal.clear()
+        terminal.setPlainText(
+            "\n".join(
+                line
+                for level, line in self.log_entries
+                if self.log_filters.get(level, True)
+            )
+        )
+        terminal.setUpdatesEnabled(True)
+        if was_at_bottom:
+            scroll_bar.setValue(scroll_bar.maximum())
 
     def _write_gui_log(self, line):
         path = getattr(self, "gui_log_path", None)
