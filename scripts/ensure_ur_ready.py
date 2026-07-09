@@ -25,6 +25,7 @@ class EnsureURReady(Node):
         self.declare_parameter("wait_timeout", 30.0)
         self.declare_parameter("target_robot_mode", 7)
         self.declare_parameter("allow_stop_restart", True)
+        self.declare_parameter("force_restart", False)
 
         self.arm_namespace = self.get_parameter("arm_namespace").value.strip("/")
         if not self.arm_namespace:
@@ -35,6 +36,7 @@ class EnsureURReady(Node):
         self.allow_stop_restart = parse_bool(
             self.get_parameter("allow_stop_restart").value
         )
+        self.force_restart = parse_bool(self.get_parameter("force_restart").value)
 
         self.program_running_client = self.create_client(
             IsProgramRunning,
@@ -139,9 +141,16 @@ class EnsureURReady(Node):
 
     def run(self):
         running = self.program_running()
-        if running:
+        if running and not self.force_restart:
             self.get_logger().info("UR program is already running.")
             return 0
+        if self.force_restart:
+            self.get_logger().warn("Force-restarting UR program to refresh reverse interface.")
+            self.call_trigger(self.stop_client, "Dashboard stop")
+            if self.set_mode(stop_program=True, play_program=True):
+                if self.wait_until_running(max(self.service_timeout, min(self.wait_timeout, 10.0))):
+                    self.get_logger().info("UR program is running after forced restart.")
+                    return 0
 
         self.get_logger().warn("UR program is not running; trying Dashboard play.")
         if self.call_trigger(self.play_client, "Dashboard play"):

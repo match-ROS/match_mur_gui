@@ -60,8 +60,11 @@ FREEDRIVE_ENABLE_WAIT_SEC = 3.0
 FREEDRIVE_ACTIVE_TRANSITION_WAIT_SEC = 4.0
 FREEDRIVE_KEEPALIVE_HZ = 10.0
 UR_REVERSE_READY_TEXT = "Robot connected to reverse interface. Ready to receive control commands."
-UR_REVERSE_WAIT_SEC = 12.0
+UR_REVERSE_DROPPED_TEXT = "Connection to reverse interface dropped."
+UR_REVERSE_WAIT_SEC = 18.0
+UR_REVERSE_STABLE_SEC = 1.2
 UR_READY_RETRY_LIMIT = 1
+ARM_TWIST_SUBSCRIBER_WARN_SEC = 2.0
 MOTION_CONTROLLERS = [
     "integrated_cartesian_admittance_controller",
     "forward_velocity_controller",
@@ -206,6 +209,7 @@ class RosWorker(QtCore.QThread):
         self.robot_names = list(robot_names or ["mur620d"])
         self._node = None
         self._arm_twist_pubs = {}
+        self._arm_twist_last_warn = {}
         self._lift_command_pubs = {}
         self._mir_twist_pubs = {}
         self._mir_goal_pubs = {}
@@ -852,6 +856,12 @@ class RosWorker(QtCore.QThread):
         msg.twist.angular.y = float(values[4])
         msg.twist.angular.z = float(values[5])
         publisher.publish(msg)
+        if publisher.get_subscription_count() == 0 and any(abs(float(v)) > 1e-6 for v in values):
+            now = time.monotonic()
+            last_warn = self._arm_twist_last_warn.get(topic, 0.0)
+            if now - last_warn > ARM_TWIST_SUBSCRIBER_WARN_SEC:
+                self._arm_twist_last_warn[topic] = now
+                self.log.emit(f"[ros] Arm jog: no subscriber discovered on {topic}")
 
     def publish_lift_target(self, robot_name, side, meters):
         if self._node is None:
@@ -879,6 +889,8 @@ class ManipulatorJogDialog(QtWidgets.QDialog):
         self.side = side
         self.mode = "translation"
         self.active = [0.0] * 6
+        self._arm_buttons = []
+        self._ready_warn_last = 0.0
         self.lift_hold_direction = 0.0
         self.setWindowTitle(f"Jog {SIDES[side]} + {'right' if side == 'r' else 'left'} lift")
         self.setMinimumWidth(520)
@@ -896,6 +908,11 @@ class ManipulatorJogDialog(QtWidgets.QDialog):
         self.mode_label = QtWidgets.QLabel("Mode: translation")
         robot_row.addWidget(self.mode_label)
         layout.addLayout(robot_row)
+        self.robot_combo.currentTextChanged.connect(lambda _text: self._update_ready_label())
+
+        self.ready_label = QtWidgets.QLabel()
+        self.ready_label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(self.ready_label)
 
         speed_row = QtWidgets.QHBoxLayout()
         self.linear_speed = QtWidgets.QDoubleSpinBox()
@@ -976,6 +993,7 @@ class ManipulatorJogDialog(QtWidgets.QDialog):
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(50)
+        self._update_ready_label()
 
     def robot_name(self):
         return self.robot_combo.currentText().strip() or "mur620d"
@@ -985,9 +1003,30 @@ class ManipulatorJogDialog(QtWidgets.QDialog):
         button.setMinimumHeight(46)
         button.pressed.connect(partial(self._set_axis, vector))
         button.released.connect(self.stop)
+        self._arm_buttons.append(button)
         grid.addWidget(button, row, column)
 
+    def arm_ready(self):
+        return self.main_window.ur_reverse_ready.get((self.robot_name(), self.side), False)
+
+    def _update_ready_label(self):
+        ready = self.arm_ready()
+        self.ready_label.setText("UR reverse OK" if ready else "UR reverse missing")
+        for button in self._arm_buttons:
+            button.setEnabled(ready)
+        return ready
+
     def _set_axis(self, vector):
+        if not self.arm_ready():
+            now = time.monotonic()
+            if now - self._ready_warn_last > ARM_TWIST_SUBSCRIBER_WARN_SEC:
+                self._ready_warn_last = now
+                self.main_window.append_log(
+                    f"[gui] Refusing arm jog {self.robot_name()}/{SIDES[self.side]}: "
+                    "UR reverse interface is not ready"
+                )
+            self.active = [0.0] * 6
+            return
         self.active = [0.0] * 6
         offset = 0 if self.mode == "translation" else 3
         speed = self.linear_speed.value() if self.mode == "translation" else self.angular_speed.value()
@@ -1000,6 +1039,9 @@ class ManipulatorJogDialog(QtWidgets.QDialog):
             self.lift_label.setText("height: -- m")
         else:
             self.lift_label.setText(f"height: {current:.4f} m")
+        if not self._update_ready_label():
+            self.active = [0.0] * 6
+            return
         self.ros_worker.publish_arm_twist(self.robot_name(), self.side, self.active)
 
     def stop(self):
@@ -2233,6 +2275,12 @@ class MurBaseGui(QtWidgets.QMainWindow):
                     self.set_ur_reverse_ready(robot, side, True, "reverse interface connected")
             return
 
+        if UR_REVERSE_DROPPED_TEXT in line:
+            for side, prefix in SIDES.items():
+                if prefix in line:
+                    self.set_ur_reverse_ready(robot, side, False, "reverse interface dropped")
+            return
+
         if "UR SetMode goal was rejected" in line:
             for side, prefix in SIDES.items():
                 if prefix in line:
@@ -2259,15 +2307,22 @@ class MurBaseGui(QtWidgets.QMainWindow):
             return
 
         for line in text.splitlines():
-            if UR_REVERSE_READY_TEXT not in line:
-                continue
             for side in sides:
-                if SIDES[side] in line:
+                if SIDES[side] not in line:
+                    continue
+                if UR_REVERSE_READY_TEXT in line:
                     self.set_ur_reverse_ready(
                         self.object_host(),
                         side,
                         True,
                         f"reverse interface seen in {HARDWARE_LATEST_LOG}",
+                    )
+                elif UR_REVERSE_DROPPED_TEXT in line:
+                    self.set_ur_reverse_ready(
+                        self.object_host(),
+                        side,
+                        False,
+                        f"reverse interface drop seen in {HARDWARE_LATEST_LOG}",
                     )
 
     def connect_selected_robots(self):
@@ -2809,6 +2864,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
                     + "-p wait_timeout:=30.0 "
                     + "-p target_robot_mode:=7 "
                     + "-p allow_stop_restart:=true"
+                    + f" -p force_restart:={'true' if retry_count > 0 else 'false'}"
                 )
             command = self.remote_ros_command(robot, " && ".join(commands))
 
@@ -2831,6 +2887,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
 
     def _wait_for_ur_reverse_ready(self, robot, sides, on_success=None, on_timeout=None):
         deadline = time.monotonic() + UR_REVERSE_WAIT_SEC
+        stable_since = {"time": None}
 
         def poll():
             missing = [
@@ -2838,13 +2895,20 @@ class MurBaseGui(QtWidgets.QMainWindow):
                 if not self.ur_reverse_ready.get((robot, side), False)
             ]
             if not missing:
-                self.append_log(
-                    f"[gui] {robot} UR reverse interface ready for: "
-                    + ", ".join(SIDES[side] for side in sides)
-                )
-                if on_success is not None:
-                    QtCore.QTimer.singleShot(200, on_success)
+                now = time.monotonic()
+                if stable_since["time"] is None:
+                    stable_since["time"] = now
+                if now - stable_since["time"] >= UR_REVERSE_STABLE_SEC:
+                    self.append_log(
+                        f"[gui] {robot} UR reverse interface ready for: "
+                        + ", ".join(SIDES[side] for side in sides)
+                    )
+                    if on_success is not None:
+                        QtCore.QTimer.singleShot(200, on_success)
+                    return
+                QtCore.QTimer.singleShot(250, poll)
                 return
+            stable_since["time"] = None
             if time.monotonic() >= deadline:
                 self.append_log(
                     "[gui] UR ready check timed out waiting for reverse interface: "
@@ -2857,12 +2921,31 @@ class MurBaseGui(QtWidgets.QMainWindow):
 
         poll()
 
-    def open_manipulator_jog(self, side):
+    def _show_manipulator_jog(self, side):
         dialog = ManipulatorJogDialog(self, side, self)
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
         self._manipulator_jog_dialog = dialog
+
+    def open_manipulator_jog(self, side):
+        robots = self.selected_robots()
+        missing_robots = [
+            robot for robot in robots
+            if not self.ur_reverse_ready.get((robot, side), False)
+        ]
+        if not missing_robots:
+            self._show_manipulator_jog(side)
+            return
+        self.append_log(
+            f"[gui] Checking {SIDES[side]} before opening jog: "
+            + ", ".join(missing_robots)
+        )
+        self.ensure_ur_ready(
+            sides=[side],
+            robots=missing_robots,
+            on_success=lambda side=side: self._show_manipulator_jog(side),
+        )
 
     def open_mir_jog(self):
         dialog = MiRJogDialog(self, self)
@@ -2953,7 +3036,8 @@ class MurBaseGui(QtWidgets.QMainWindow):
         for robot in self.selected_robots():
             cmd = (
                 self.remote_setup_prefix()
-                + "exec ros2 run match_mur_gui move_arm_to_named_pose.py --ros-args "
+                + "exec timeout --signal=TERM --kill-after=5s 90s "
+                + "ros2 run match_mur_gui move_arm_to_named_pose.py --ros-args "
                 + f"-p robot_name:={robot} "
                 + f"-p robot_profile:={self.robot_profile(robot)} "
                 + f"-p arm:={side} "
@@ -2969,7 +3053,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
     def stop_managed_processes(self):
         self.stop_module_motion_like_actions()
         cleanup_patterns = [
-            "move_arm_to_named_pose.py",
+            "[m]ove_arm_to_named_pose.py",
         ]
         cleanup_cmd = " ; ".join(
             f"pkill -TERM -f {shlex.quote(pattern)} 2>/dev/null || true"
