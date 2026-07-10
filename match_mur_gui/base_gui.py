@@ -29,6 +29,8 @@ from std_srvs.srv import Trigger
 from ewellix_interfaces.msg import Command as EwellixCommand
 from mir_srvs.srv import ColorRGB
 
+from match_mur_gui.alignment import plane_alignment, plane_alignments
+
 
 WS = os.environ.get("WS", "/home/rosmatch/colcon_ws")
 REMOTE_WS_DEFAULT = os.environ.get("REMOTE_WS", "/home/rosmatch/colcon_ws")
@@ -956,6 +958,231 @@ class RosWorker(QtCore.QThread):
         return True, f"sent lift target {meters:.4f} m on {topic}"
 
 
+class PlanePreviewWidget(QtWidgets.QWidget):
+    """Small isometric cube that highlights one base-frame plane."""
+
+    def __init__(self, plane, color, parent=None):
+        super().__init__(parent)
+        self.plane = plane.upper()
+        self.color = QtGui.QColor(color)
+        self.setFixedSize(150, 112)
+
+    def _project(self, point):
+        x_value, y_value, z_value = point
+        return QtCore.QPointF(
+            self.width() * 0.50 + 42.0 * x_value - 30.0 * y_value,
+            self.height() * 0.62 + 16.0 * x_value + 20.0 * y_value - 40.0 * z_value,
+        )
+
+    def _draw_arrow(self, painter, start, end, label):
+        painter.drawLine(start, end)
+        angle = math.atan2(end.y() - start.y(), end.x() - start.x())
+        arrow_size = 6.0
+        for offset in (-0.55, 0.55):
+            arrow_end = QtCore.QPointF(
+                end.x() - arrow_size * math.cos(angle + offset),
+                end.y() - arrow_size * math.sin(angle + offset),
+            )
+            painter.drawLine(end, arrow_end)
+        painter.drawText(end + QtCore.QPointF(4.0, -3.0), label)
+
+    def paintEvent(self, _event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        painter.fillRect(self.rect(), QtGui.QColor("#f7fafc"))
+
+        plane_points = {
+            "XY": [(-0.72, -0.72, 0.0), (0.72, -0.72, 0.0), (0.72, 0.72, 0.0), (-0.72, 0.72, 0.0)],
+            "XZ": [(-0.72, 0.0, -0.72), (0.72, 0.0, -0.72), (0.72, 0.0, 0.72), (-0.72, 0.0, 0.72)],
+            "YZ": [(0.0, -0.72, -0.72), (0.0, 0.72, -0.72), (0.0, 0.72, 0.72), (0.0, -0.72, 0.72)],
+        }
+        polygon = QtGui.QPolygonF([self._project(point) for point in plane_points[self.plane]])
+        fill = QtGui.QColor(self.color)
+        fill.setAlpha(78)
+        painter.setPen(QtGui.QPen(self.color, 2.0))
+        painter.setBrush(fill)
+        painter.drawPolygon(polygon)
+
+        vertices = [
+            (x_value, y_value, z_value)
+            for x_value in (-0.72, 0.72)
+            for y_value in (-0.72, 0.72)
+            for z_value in (-0.72, 0.72)
+        ]
+        painter.setBrush(QtCore.Qt.NoBrush)
+        painter.setPen(QtGui.QPen(QtGui.QColor("#718096"), 1.0))
+        for index, first in enumerate(vertices):
+            for second in vertices[index + 1:]:
+                differences = sum(a != b for a, b in zip(first, second))
+                if differences == 1:
+                    painter.drawLine(self._project(first), self._project(second))
+
+        origin = self._project((0.0, 0.0, 0.0))
+        painter.setBrush(QtGui.QColor("#1a202c"))
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.drawEllipse(origin, 3.0, 3.0)
+
+        normal_axis = {"XY": (0.0, 0.0, 1.0), "XZ": (0.0, 1.0, 0.0), "YZ": (1.0, 0.0, 0.0)}[self.plane]
+        axis_name = {"XY": "Z", "XZ": "Y", "YZ": "X"}[self.plane]
+        painter.setBrush(QtCore.Qt.NoBrush)
+        painter.setPen(QtGui.QPen(self.color, 2.0))
+        positive = self._project(tuple(1.05 * value for value in normal_axis))
+        negative = self._project(tuple(-1.05 * value for value in normal_axis))
+        self._draw_arrow(painter, origin, positive, f"+{axis_name}")
+        self._draw_arrow(painter, origin, negative, f"-{axis_name}")
+
+        font = painter.font()
+        font.setBold(True)
+        font.setPointSize(10)
+        painter.setFont(font)
+        painter.setPen(QtGui.QColor("#1a202c"))
+        painter.drawText(7, 17, self.plane)
+
+
+class ArmAlignmentDialog(QtWidgets.QDialog):
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.alignment_buttons = []
+        self.setWindowTitle("Align TCP to Plane")
+        self.setMinimumWidth(690)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        selection = QtWidgets.QHBoxLayout()
+        selection.addWidget(QtWidgets.QLabel("Robot"))
+        self.robot_combo = QtWidgets.QComboBox()
+        self.robot_combo.addItems(main_window.selected_robots())
+        selection.addWidget(self.robot_combo, 1)
+
+        selection.addWidget(QtWidgets.QLabel("Arm"))
+        self.arm_group = QtWidgets.QButtonGroup(self)
+        default_side = main_window.selected_sides()[0] if main_window.selected_sides() else "r"
+        for side in ("l", "r"):
+            button = QtWidgets.QPushButton(SIDES[side])
+            button.setCheckable(True)
+            button.setProperty("side", side)
+            button.setChecked(side == default_side)
+            button.setStyleSheet(
+                "QPushButton { padding: 5px 10px; }"
+                "QPushButton:checked { background: #2d3748; color: white; font-weight: bold; }"
+            )
+            self.arm_group.addButton(button)
+            button.toggled.connect(self.update_reference_frame)
+            selection.addWidget(button)
+        layout.addLayout(selection)
+        self.robot_combo.currentTextChanged.connect(self.update_reference_frame)
+
+        speed_row = QtWidgets.QHBoxLayout()
+        speed_row.addWidget(QtWidgets.QLabel("Angular speed (rad/s)"))
+        self.angular_speed = QtWidgets.QDoubleSpinBox()
+        self.angular_speed.setRange(0.03, 0.30)
+        self.angular_speed.setDecimals(2)
+        self.angular_speed.setSingleStep(0.02)
+        self.angular_speed.setValue(0.10)
+        speed_row.addWidget(self.angular_speed)
+        speed_row.addStretch(1)
+        self.frame_label = QtWidgets.QLabel()
+        speed_row.addWidget(self.frame_label)
+        layout.addLayout(speed_row)
+        self.update_reference_frame()
+
+        planes_layout = QtWidgets.QGridLayout()
+        planes_layout.setHorizontalSpacing(12)
+        planes_layout.setVerticalSpacing(10)
+        for column, plane in enumerate(("XY", "XZ", "YZ")):
+            alignments = plane_alignments(plane)
+            preview = PlanePreviewWidget(plane, alignments[0].color, self)
+            planes_layout.addWidget(preview, 0, column, alignment=QtCore.Qt.AlignHCenter)
+
+            button_layout = QtWidgets.QVBoxLayout()
+            for alignment in alignments:
+                button = QtWidgets.QPushButton(
+                    f"{alignment.side_label}\n{alignment.direction_label}"
+                )
+                button.setMinimumSize(190, 54)
+                button.setToolTip(
+                    f"Hold TCP position and align tool Z with {alignment.tool_z_axis} "
+                    "in the selected arm base frame"
+                )
+                button.setStyleSheet(
+                    f"QPushButton {{ border: 1px solid {alignment.color}; padding: 6px; }}"
+                    f"QPushButton:hover {{ background: {alignment.color}; color: white; }}"
+                    f"QPushButton:pressed {{ background: {alignment.color}; color: white; font-weight: bold; }}"
+                )
+                button.clicked.connect(partial(self.start_alignment, alignment.key))
+                self.alignment_buttons.append(button)
+                button_layout.addWidget(button)
+            planes_layout.addLayout(button_layout, 1, column)
+        layout.addLayout(planes_layout)
+
+        self.status_label = QtWidgets.QLabel("Ready")
+        self.status_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.status_label.setMinimumHeight(28)
+        layout.addWidget(self.status_label)
+
+        actions = QtWidgets.QHBoxLayout()
+        stop_button = QtWidgets.QPushButton("Stop")
+        stop_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaStop))
+        stop_button.setStyleSheet(
+            "QPushButton { background: #c53030; color: white; font-weight: bold; padding: 6px 14px; }"
+            "QPushButton:hover { background: #b52a2a; }"
+        )
+        stop_button.clicked.connect(self.stop_alignment)
+        close_button = QtWidgets.QPushButton("Close")
+        close_button.clicked.connect(self.close)
+        actions.addWidget(stop_button)
+        actions.addStretch(1)
+        actions.addWidget(close_button)
+        layout.addLayout(actions)
+
+    def selected_side(self):
+        button = self.arm_group.checkedButton()
+        return button.property("side") if button is not None else "r"
+
+    def update_reference_frame(self, _value=None):
+        robot = self.robot_combo.currentText().strip() or "mur620d"
+        self.frame_label.setText(f"Reference: {robot}/{SIDES[self.selected_side()]}/base_link")
+
+    def set_busy(self, busy):
+        for button in self.alignment_buttons:
+            button.setEnabled(not busy)
+        self.robot_combo.setEnabled(not busy)
+        for button in self.arm_group.buttons():
+            button.setEnabled(not busy)
+
+    def start_alignment(self, alignment_key):
+        alignment = plane_alignment(alignment_key)
+        robot = self.robot_combo.currentText().strip() or "mur620d"
+        side = self.selected_side()
+        self.set_busy(True)
+        self.status_label.setText(
+            f"Preparing {robot}/{SIDES[side]}: {alignment.plane}, {alignment.direction_label}"
+        )
+        ok, message = self.main_window.request_plane_alignment(
+            robot,
+            side,
+            alignment.key,
+            self.angular_speed.value(),
+            self.alignment_finished,
+        )
+        if not ok:
+            self.set_busy(False)
+            self.status_label.setText(message)
+
+    def alignment_finished(self, exit_code, _status):
+        self.set_busy(False)
+        if exit_code == 0:
+            self.status_label.setText("Alignment complete")
+        elif exit_code == 130:
+            self.status_label.setText("Alignment stopped")
+        else:
+            self.status_label.setText(f"Alignment failed (exit {exit_code}); see GUI log")
+
+    def stop_alignment(self):
+        self.status_label.setText("Stopping arm motion...")
+        self.main_window.stop_all_arm_motion()
+
+
 class ManipulatorJogDialog(QtWidgets.QDialog):
     def __init__(self, main_window, side, parent=None):
         super().__init__(parent)
@@ -1122,6 +1349,12 @@ class ManipulatorJogDialog(QtWidgets.QDialog):
     def stop(self):
         self.active = [0.0] * 6
         self.ros_worker.publish_arm_twist(self.robot_name(), self.side, self.active)
+
+    def suspend(self):
+        self.stop_lift_jog()
+        self.stop()
+        self.timer.stop()
+        self.close()
 
     def toggle_mode(self):
         self.mode = "rotation" if self.mode == "translation" else "translation"
@@ -1757,7 +1990,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.setWindowTitle(window_title)
         self.resize(1180, 780)
         self.processes = {}
-        self._arm_motion_generation = 0
+        self._arm_motion_generation = {}
         self.arm_status = {}
         self.ur_reverse_ready = {}
         self.ur_ready_log_scan_start = {}
@@ -1817,6 +2050,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.add_action_button("Jog R", partial(self.open_manipulator_jog, "r"), section="UR")
         self.freedrive_button = self.add_action_button("Freedrive", self.toggle_freedrive, section="UR")
         self.update_freedrive_button()
+        self.add_action_button("Align", self.open_arm_alignment, section="UR")
         self.stop_arm_motion_button = self.add_action_button(
             "STOP ARM MOTION", self.stop_all_arm_motion, section="UR"
         )
@@ -3039,6 +3273,13 @@ class MurBaseGui(QtWidgets.QMainWindow):
             on_success=lambda side=side: self._show_manipulator_jog(side),
         )
 
+    def open_arm_alignment(self):
+        dialog = ArmAlignmentDialog(self, self)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self._arm_alignment_dialog = dialog
+
     def open_mir_jog(self):
         dialog = MiRJogDialog(self, self)
         dialog.show()
@@ -3070,10 +3311,24 @@ class MurBaseGui(QtWidgets.QMainWindow):
             for side in SIDES:
                 self.ros_worker.publish_arm_twist(robot, side, zero_twist)
 
-    def _terminate_home_processes(self, robots):
-        home_process_suffixes = (":home_l", ":home_r")
+    def _publish_zero_arm_twist(self, robot, side):
+        self.ros_worker.publish_arm_twist(robot, side, [0.0] * 6)
+
+    @staticmethod
+    def _kill_process_if_running(process):
+        if process.state() != QtCore.QProcess.NotRunning:
+            process.kill()
+
+    def _terminate_arm_motion_processes(self, robots, sides=None):
+        sides = tuple(sides or SIDES)
+        process_names = {
+            self.process_key(robot, f"{kind}_{side}")
+            for robot in robots
+            for side in sides
+            for kind in ("home", "align")
+        }
         for name, process in list(self.processes.items()):
-            if not name.endswith(home_process_suffixes):
+            if name not in process_names:
                 continue
             if process.state() == QtCore.QProcess.NotRunning:
                 continue
@@ -3081,28 +3336,144 @@ class MurBaseGui(QtWidgets.QMainWindow):
             process.terminate()
             QtCore.QTimer.singleShot(
                 500,
-                lambda proc=process: (
-                    proc.kill()
-                    if proc.state() != QtCore.QProcess.NotRunning
-                    else None
-                ),
+                partial(self._kill_process_if_running, process),
             )
 
-        pattern = "[m]ove_arm_to_named_pose.py"
-        cleanup_cmd = (
-            f"pkill -TERM -f {shlex.quote(pattern)} 2>/dev/null || true ; "
-            "sleep 0.2 ; "
-            f"pkill -KILL -f {shlex.quote(pattern)} 2>/dev/null || true"
+        cleanup_patterns = [
+            pattern
+            for side in sides
+            for pattern in (
+                f"[m]ove_arm_to_named_pose.py.*arm:={side}",
+                f"[a]lign_arm_to_plane.py.*--arm {side}",
+            )
+        ]
+        cleanup_cmd = " ; ".join(
+            f"pkill -TERM -f {shlex.quote(pattern)} 2>/dev/null || true"
+            for pattern in cleanup_patterns
         )
+        cleanup_cmd += " ; sleep 0.5 ; "
+        cleanup_cmd += " ; ".join(
+            f"pkill -KILL -f {shlex.quote(pattern)} 2>/dev/null || true"
+            for pattern in cleanup_patterns
+        )
+        cleanup_key = "arm_motion_stop_cleanup_" + "".join(sorted(sides))
         for robot in robots:
             self.start_process(
-                self.process_key(robot, "arm_motion_stop_cleanup"),
+                self.process_key(robot, cleanup_key),
                 self.remote_command(robot, cleanup_cmd),
             )
 
+    def _suspend_arm_jog(self, robot, side):
+        for dialog in self.findChildren(ManipulatorJogDialog):
+            if dialog.robot_name() == robot and dialog.side == side:
+                dialog.suspend()
+
+    def _next_arm_motion_generation(self, robot, side):
+        key = (robot, side)
+        generation = self._arm_motion_generation.get(key, 0) + 1
+        self._arm_motion_generation[key] = generation
+        return generation
+
+    def _arm_motion_generation_is_current(self, robot, side, generation):
+        return self._arm_motion_generation.get((robot, side), 0) == generation
+
+    def _prepare_arm_motion_profile(self, robots, sides):
+        self.stop_module_motion_like_actions()
+        cancel_requests = 0
+        for robot in robots:
+            for side in sides:
+                self._suspend_arm_jog(robot, side)
+                self._publish_zero_arm_twist(robot, side)
+                cancel_requests += self.ros_worker.cancel_arm_motion_goals(robot, side)
+                for index in range(1, 6):
+                    QtCore.QTimer.singleShot(
+                        index * ARM_STOP_ZERO_TWIST_INTERVAL_MS,
+                        partial(self._publish_zero_arm_twist, robot, side),
+                    )
+        self._terminate_arm_motion_processes(robots, sides)
+        return cancel_requests
+
+    def request_plane_alignment(
+        self,
+        robot,
+        side,
+        alignment_key,
+        max_angular_velocity,
+        on_finished=None,
+    ):
+        alignment = plane_alignment(alignment_key)
+        if not self.ur_reverse_ready.get((robot, side), False):
+            message = f"UR reverse missing for {robot}/{SIDES[side]}"
+            self.append_log(f"[gui] Refusing alignment: {message}")
+            return False, message
+        if self.freedrive_active.get((robot, side), False):
+            message = f"Disable freedrive first for {robot}/{SIDES[side]}"
+            self.append_log(f"[gui] Refusing alignment: {message}")
+            return False, message
+
+        generation = self._next_arm_motion_generation(robot, side)
+        cancel_requests = self._prepare_arm_motion_profile([robot], [side])
+
+        self.append_log(
+            f"[gui] Preparing alignment {robot}/{SIDES[side]}: {alignment.plane}, "
+            f"{alignment.side_label}, {alignment.direction_label}; "
+            f"cancel_requests={cancel_requests}"
+        )
+        QtCore.QTimer.singleShot(
+            650,
+            partial(
+                self._start_plane_alignment,
+                robot,
+                side,
+                alignment.key,
+                max_angular_velocity,
+                generation,
+                on_finished,
+            ),
+        )
+        return True, "Alignment queued"
+
+    def _start_plane_alignment(
+        self,
+        robot,
+        side,
+        alignment_key,
+        max_angular_velocity,
+        generation,
+        on_finished=None,
+    ):
+        if not self._arm_motion_generation_is_current(robot, side, generation):
+            self.append_log(f"[gui] Alignment {robot}/{SIDES[side]} canceled before start")
+            if on_finished is not None:
+                on_finished(130, QtCore.QProcess.CrashExit)
+            return
+        max_angular_velocity = max(0.03, min(0.30, max_angular_velocity))
+        alignment_timeout = max(
+            90.0,
+            1.875 * math.pi / max_angular_velocity + 20.0,
+        )
+        process_timeout = math.ceil(alignment_timeout + 10.0)
+        command = (
+            self.remote_setup_prefix()
+            + f"exec timeout --signal=TERM --kill-after=3s {process_timeout}s "
+            + "ros2 run match_mur_gui align_arm_to_plane.py "
+            + f"--robot-name {shlex.quote(robot)} "
+            + f"--arm {shlex.quote(side)} "
+            + f"--alignment {shlex.quote(alignment_key)} "
+            + f"--max-angular-velocity {max_angular_velocity:.3f} "
+            + f"--timeout {alignment_timeout:.1f}"
+        )
+        self.start_process(
+            self.process_key(robot, f"align_{side}"),
+            self.remote_command(robot, command),
+            on_finished=on_finished,
+        )
+
     def stop_all_arm_motion(self):
         robots = list(self.selected_robots())
-        self._arm_motion_generation += 1
+        for robot in robots:
+            for side in SIDES:
+                self._next_arm_motion_generation(robot, side)
         self.append_log(
             "[gui] STOP ARM MOTION: canceling motion profiles and stopping both arms for "
             + ", ".join(robots)
@@ -3118,7 +3489,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
         for robot in robots:
             for side in SIDES:
                 cancel_requests += self.ros_worker.cancel_arm_motion_goals(robot, side)
-        self._terminate_home_processes(robots)
+        self._terminate_arm_motion_processes(robots)
 
         for index in range(1, ARM_STOP_ZERO_TWIST_COUNT):
             QtCore.QTimer.singleShot(
@@ -3172,12 +3543,15 @@ class MurBaseGui(QtWidgets.QMainWindow):
 
     def move_home(self, side):
         prefix = SIDES[side]
-        for robot in self.selected_robots():
+        robots = list(self.selected_robots())
+        generations = {}
+        for robot in robots:
             if self.freedrive_active.get((robot, side), False):
                 self.append_log(f"[gui] Home {robot}/{prefix}: disabling freedrive first")
                 self.ros_worker.switch_freedrive(
                     robot, side, False, self.fallback_motion_controller()
                 )
+            generations[robot] = self._next_arm_motion_generation(robot, side)
         if not self.opt_moveit.isChecked():
             self.append_log(
                 f"[gui] Home {prefix}: Launch MoveIt is disabled. "
@@ -3186,18 +3560,25 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.append_log(
             f"[gui] Home {prefix}: stopping module motion first."
         )
-        self.stop_module_motion_like_actions()
-        generation = self._arm_motion_generation
+        cancel_requests = self._prepare_arm_motion_profile(robots, [side])
+        self.append_log(
+            f"[gui] Home {prefix}: sent cancel requests to {cancel_requests} arm action(s)"
+        )
         QtCore.QTimer.singleShot(
-            500, partial(self._start_home_process, side, generation)
+            650, partial(self._start_home_process, side, robots, generations)
         )
 
-    def _start_home_process(self, side, generation=None):
-        if generation is not None and generation != self._arm_motion_generation:
-            self.append_log(f"[gui] Home {SIDES[side]} canceled before start")
-            return
+    def _start_home_process(self, side, robots=None, generations=None):
         prefix = SIDES[side]
-        for robot in self.selected_robots():
+        robots = list(robots or self.selected_robots())
+        generations = generations or {}
+        for robot in robots:
+            generation = generations.get(robot)
+            if generation is not None and not self._arm_motion_generation_is_current(
+                robot, side, generation
+            ):
+                self.append_log(f"[gui] Home {robot}/{prefix} canceled before start")
+                continue
             cmd = (
                 self.remote_setup_prefix()
                 + "exec timeout --signal=TERM --kill-after=5s 90s "
@@ -3217,6 +3598,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
     def stop_managed_processes(self):
         self.stop_module_motion_like_actions()
         cleanup_patterns = [
+            "[a]lign_arm_to_plane.py",
             "[m]ove_arm_to_named_pose.py",
         ]
         cleanup_cmd = " ; ".join(
