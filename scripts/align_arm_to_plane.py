@@ -15,7 +15,7 @@ from tf2_ros import Buffer, TransformException, TransformListener
 
 from match_mur_gui.alignment import (
     PLANE_ALIGNMENT_BY_KEY,
-    alignment_quaternion,
+    nearest_alignment_quaternion,
     plane_alignment,
 )
 
@@ -58,7 +58,11 @@ class AlignArmToPlane(Node):
                     rclpy.time.Time(),
                 )
                 translation = transform.transform.translation
-                return (translation.x, translation.y, translation.z)
+                rotation = transform.transform.rotation
+                return (
+                    (translation.x, translation.y, translation.z),
+                    (rotation.x, rotation.y, rotation.z, rotation.w),
+                )
             except TransformException as exc:
                 last_error = exc
                 rclpy.spin_once(self, timeout_sec=0.05)
@@ -68,8 +72,11 @@ class AlignArmToPlane(Node):
             f"Could not lookup current TCP pose {self.base_frame}->{self.tip_frame}: {last_error}"
         )
 
-    def target_pose(self, position):
-        quaternion = alignment_quaternion(self.alignment)
+    def target_pose(self, position, current_quaternion):
+        quaternion = nearest_alignment_quaternion(
+            current_quaternion,
+            self.alignment,
+        )
         pose = PoseStamped()
         pose.header.stamp = self.get_clock().now().to_msg()
         pose.header.frame_id = self.base_frame
@@ -106,9 +113,10 @@ class AlignArmToPlane(Node):
         self.cancel_active_goal()
 
     def run(self):
-        position = self.current_pose()
-        if self.stop_requested or position is None:
+        current_pose = self.current_pose()
+        if self.stop_requested or current_pose is None:
             return 130
+        position, current_quaternion = current_pose
         if not self.action_client.wait_for_server(timeout_sec=self.args.server_timeout):
             self.get_logger().error(f"Alignment action is unavailable: {self.action_name}")
             return 2
@@ -118,7 +126,7 @@ class AlignArmToPlane(Node):
         goal = JparseMove.Goal()
         goal.mode = "task_space"
         goal.accuracy = "precision"
-        goal.target_pose = self.target_pose(position)
+        goal.target_pose = self.target_pose(position, current_quaternion)
         goal.max_linear_velocity = self.args.max_linear_velocity
         goal.max_angular_velocity = self.args.max_angular_velocity
         goal.timeout = self.args.timeout
@@ -126,6 +134,7 @@ class AlignArmToPlane(Node):
         self.get_logger().info(
             f"Aligning {self.args.robot_name}/{self.arm_name} to {self.alignment.plane} "
             f"from {self.alignment.side_label}: {self.alignment.direction_label}; "
+            "using the nearest orientation without additional normal-axis spin; "
             f"holding TCP position ({position[0]:.4f}, {position[1]:.4f}, {position[2]:.4f}) "
             f"in {self.base_frame}"
         )
