@@ -13,6 +13,7 @@ from functools import partial
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 import rclpy
+from action_msgs.srv import CancelGoal
 from controller_manager_msgs.srv import (
     ConfigureController,
     ListControllers,
@@ -65,6 +66,8 @@ UR_REVERSE_WAIT_SEC = 18.0
 UR_REVERSE_STABLE_SEC = 1.2
 UR_READY_RETRY_LIMIT = 1
 ARM_TWIST_SUBSCRIBER_WARN_SEC = 2.0
+ARM_STOP_ZERO_TWIST_COUNT = 10
+ARM_STOP_ZERO_TWIST_INTERVAL_MS = 100
 MOTION_CONTROLLERS = [
     "integrated_cartesian_admittance_controller",
     "forward_velocity_controller",
@@ -210,6 +213,8 @@ class RosWorker(QtCore.QThread):
         self._node = None
         self._arm_twist_pubs = {}
         self._arm_twist_last_warn = {}
+        self._cancel_goal_clients = {}
+        self._cancel_goal_futures = set()
         self._lift_command_pubs = {}
         self._mir_twist_pubs = {}
         self._mir_goal_pubs = {}
@@ -862,6 +867,76 @@ class RosWorker(QtCore.QThread):
             if now - last_warn > ARM_TWIST_SUBSCRIBER_WARN_SEC:
                 self._arm_twist_last_warn[topic] = now
                 self.log.emit(f"[ros] Arm jog: no subscriber discovered on {topic}")
+
+    @staticmethod
+    def _is_arm_cancel_service(service_name, robot_name, side):
+        suffix = "/_action/cancel_goal"
+        robot_prefix = f"/{robot_name}/"
+        if not service_name.startswith(robot_prefix) or not service_name.endswith(suffix):
+            return False
+        relative_name = service_name[len(robot_prefix): -len(suffix)]
+        arm_prefixes = (
+            f"UR10_{side}/",
+            f"jparse_move_{side}",
+            f"moveit_joint_trajectory_controller_{side}/",
+            f"moveit_joint_trajectory_controller_lift_{side}/",
+            f"joint_trajectory_controller_{side}/",
+            f"joint_trajectory_controller_lift_{side}/",
+        )
+        return relative_name.startswith(arm_prefixes)
+
+    def cancel_arm_motion_goals(self, robot_name, side):
+        if self._node is None:
+            return 0
+        try:
+            services = self._node.get_service_names_and_types()
+        except Exception as exc:  # noqa: BLE001
+            self.log.emit(
+                f"[ros] Could not discover motion actions for {robot_name}/{SIDES[side]}: {exc}"
+            )
+            return 0
+
+        cancel_services = sorted(
+            service_name
+            for service_name, service_types in services
+            if "action_msgs/srv/CancelGoal" in service_types
+            and self._is_arm_cancel_service(service_name, robot_name, side)
+        )
+        requested = 0
+        for service_name in cancel_services:
+            with self._lock:
+                client = self._cancel_goal_clients.get(service_name)
+                if client is None:
+                    client = self._node.create_client(CancelGoal, service_name)
+                    self._cancel_goal_clients[service_name] = client
+            if not client.service_is_ready():
+                continue
+            future = client.call_async(CancelGoal.Request())
+            with self._lock:
+                self._cancel_goal_futures.add(future)
+            future.add_done_callback(
+                partial(self._on_cancel_goal_done, robot_name, side, service_name)
+            )
+            requested += 1
+        return requested
+
+    def _on_cancel_goal_done(self, robot_name, side, service_name, future):
+        with self._lock:
+            self._cancel_goal_futures.discard(future)
+        try:
+            response = future.result()
+        except Exception as exc:  # noqa: BLE001
+            self.log.emit(
+                f"[ros] Motion cancel failed for {robot_name}/{SIDES[side]} "
+                f"via {service_name}: {exc}"
+            )
+            return
+        canceled_count = len(response.goals_canceling)
+        if canceled_count:
+            self.log.emit(
+                f"[ros] Motion cancel accepted for {robot_name}/{SIDES[side]} "
+                f"via {service_name}: {canceled_count} goal(s)"
+            )
 
     def publish_lift_target(self, robot_name, side, meters):
         if self._node is None:
@@ -1682,6 +1757,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.setWindowTitle(window_title)
         self.resize(1180, 780)
         self.processes = {}
+        self._arm_motion_generation = 0
         self.arm_status = {}
         self.ur_reverse_ready = {}
         self.ur_ready_log_scan_start = {}
@@ -1741,6 +1817,22 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.add_action_button("Jog R", partial(self.open_manipulator_jog, "r"), section="UR")
         self.freedrive_button = self.add_action_button("Freedrive", self.toggle_freedrive, section="UR")
         self.update_freedrive_button()
+        self.stop_arm_motion_button = self.add_action_button(
+            "STOP ARM MOTION", self.stop_all_arm_motion, section="UR"
+        )
+        self.stop_arm_motion_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_MediaStop)
+        )
+        self.stop_arm_motion_button.setMinimumHeight(42)
+        self.stop_arm_motion_button.setToolTip(
+            "Cancel active arm motions and send zero twist to both arms"
+        )
+        self.stop_arm_motion_button.setStyleSheet(
+            "QPushButton { background: #c53030; color: white; font-weight: bold; "
+            "border: 1px solid #9b2c2c; padding: 7px 10px; }"
+            "QPushButton:hover { background: #b52a2a; }"
+            "QPushButton:pressed { background: #822727; }"
+        )
 
         self.terminal = QtWidgets.QPlainTextEdit()
         self.terminal.setReadOnly(True)
@@ -2972,6 +3064,72 @@ class MurBaseGui(QtWidgets.QMainWindow):
         for module in self.modules:
             module.stop_motion_like_actions()
 
+    def _publish_zero_arm_twists(self, robots):
+        zero_twist = [0.0] * 6
+        for robot in robots:
+            for side in SIDES:
+                self.ros_worker.publish_arm_twist(robot, side, zero_twist)
+
+    def _terminate_home_processes(self, robots):
+        home_process_suffixes = (":home_l", ":home_r")
+        for name, process in list(self.processes.items()):
+            if not name.endswith(home_process_suffixes):
+                continue
+            if process.state() == QtCore.QProcess.NotRunning:
+                continue
+            self.append_log(f"[gui] terminating active arm motion process {name}")
+            process.terminate()
+            QtCore.QTimer.singleShot(
+                500,
+                lambda proc=process: (
+                    proc.kill()
+                    if proc.state() != QtCore.QProcess.NotRunning
+                    else None
+                ),
+            )
+
+        pattern = "[m]ove_arm_to_named_pose.py"
+        cleanup_cmd = (
+            f"pkill -TERM -f {shlex.quote(pattern)} 2>/dev/null || true ; "
+            "sleep 0.2 ; "
+            f"pkill -KILL -f {shlex.quote(pattern)} 2>/dev/null || true"
+        )
+        for robot in robots:
+            self.start_process(
+                self.process_key(robot, "arm_motion_stop_cleanup"),
+                self.remote_command(robot, cleanup_cmd),
+            )
+
+    def stop_all_arm_motion(self):
+        robots = list(self.selected_robots())
+        self._arm_motion_generation += 1
+        self.append_log(
+            "[gui] STOP ARM MOTION: canceling motion profiles and stopping both arms for "
+            + ", ".join(robots)
+        )
+
+        for dialog in self.findChildren(ManipulatorJogDialog):
+            dialog.stop_lift_jog()
+            dialog.stop()
+        self.stop_module_motion_like_actions()
+
+        self._publish_zero_arm_twists(robots)
+        cancel_requests = 0
+        for robot in robots:
+            for side in SIDES:
+                cancel_requests += self.ros_worker.cancel_arm_motion_goals(robot, side)
+        self._terminate_home_processes(robots)
+
+        for index in range(1, ARM_STOP_ZERO_TWIST_COUNT):
+            QtCore.QTimer.singleShot(
+                index * ARM_STOP_ZERO_TWIST_INTERVAL_MS,
+                partial(self._publish_zero_arm_twists, robots),
+            )
+        self.append_log(
+            f"[gui] STOP ARM MOTION: sent cancel requests to {cancel_requests} arm action(s); "
+            f"sending {ARM_STOP_ZERO_TWIST_COUNT} zero twists per arm"
+        )
+
     def toggle_freedrive(self):
         pairs = self.robot_arm_pairs()
         if not pairs:
@@ -3029,9 +3187,15 @@ class MurBaseGui(QtWidgets.QMainWindow):
             f"[gui] Home {prefix}: stopping module motion first."
         )
         self.stop_module_motion_like_actions()
-        QtCore.QTimer.singleShot(500, partial(self._start_home_process, side))
+        generation = self._arm_motion_generation
+        QtCore.QTimer.singleShot(
+            500, partial(self._start_home_process, side, generation)
+        )
 
-    def _start_home_process(self, side):
+    def _start_home_process(self, side, generation=None):
+        if generation is not None and generation != self._arm_motion_generation:
+            self.append_log(f"[gui] Home {SIDES[side]} canceled before start")
+            return
         prefix = SIDES[side]
         for robot in self.selected_robots():
             cmd = (
