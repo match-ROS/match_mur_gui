@@ -24,6 +24,7 @@ QUERY_COMMANDS = (
     "safetystatus",
     "safetymode",
     "programState",
+    "is in remote control",
     "get loaded program",
 )
 
@@ -83,6 +84,8 @@ def query_dashboard(host, port, timeout, clear=False, settle_sec=0.5):
         "queries": [],
         "clear": [],
         "error": "",
+        "blocking_reasons": [],
+        "remote_control": None,
     }
     try:
         with DashboardClient(host, port, timeout) as dashboard:
@@ -93,7 +96,19 @@ def query_dashboard(host, port, timeout, clear=False, settle_sec=0.5):
                 answer = dashboard.query(command)
                 result["queries"].append({"command": command, "answer": answer})
                 query_lines.append(answer)
-            result["blocked"] = is_blocking_safety_state(query_lines)
+            if is_blocking_safety_state(query_lines):
+                result["blocked"] = True
+                result["blocking_reasons"].append("Robot in Protective Stop or Safety Stop")
+            for query in result["queries"]:
+                if query["command"] == "is in remote control":
+                    answer = str(query["answer"]).strip().lower()
+                    if answer in ("true", "remote control: true", "is in remote control: true"):
+                        result["remote_control"] = True
+                    elif answer in ("false", "remote control: false", "is in remote control: false"):
+                        result["remote_control"] = False
+                        result["blocked"] = True
+                        result["blocking_reasons"].append("Robot not in remote control mode")
+                    break
 
             if clear and result["blocked"]:
                 for command in CLEAR_COMMANDS:
@@ -107,7 +122,21 @@ def query_dashboard(host, port, timeout, clear=False, settle_sec=0.5):
                     answer = dashboard.query(command)
                     result["queries_after_clear"].append({"command": command, "answer": answer})
                     after_lines.append(answer)
-                result["blocked"] = is_blocking_safety_state(after_lines)
+                result["blocking_reasons"] = []
+                result["blocked"] = False
+                if is_blocking_safety_state(after_lines):
+                    result["blocked"] = True
+                    result["blocking_reasons"].append("Robot in Protective Stop or Safety Stop")
+                for query in result["queries_after_clear"]:
+                    if query["command"] == "is in remote control":
+                        answer = str(query["answer"]).strip().lower()
+                        if answer in ("true", "remote control: true", "is in remote control: true"):
+                            result["remote_control"] = True
+                        elif answer in ("false", "remote control: false", "is in remote control: false"):
+                            result["remote_control"] = False
+                            result["blocked"] = True
+                            result["blocking_reasons"].append("Robot not in remote control mode")
+                        break
     except OSError as exc:
         result["error"] = str(exc)
     return result
@@ -143,6 +172,8 @@ def main():
             print(f"{arm['host']}: reachable={arm['reachable']} blocked={arm['blocked']}")
             if arm["error"]:
                 print(f"  error: {arm['error']}")
+            for reason in arm.get("blocking_reasons", []):
+                print(f"  diagnosis: {reason}")
             for query in arm["queries"]:
                 print(f"  {query['command']}: {query['answer']}")
             for command in arm["clear"]:
