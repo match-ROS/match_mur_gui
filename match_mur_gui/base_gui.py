@@ -1992,6 +1992,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.processes = {}
         self._arm_motion_generation = {}
         self.arm_status = {}
+        self.arm_feedback = {}
         self.ur_reverse_ready = {}
         self.ur_ready_log_scan_start = {}
         self.freedrive_active = {}
@@ -2198,6 +2199,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
         for robot in ROBOTS:
             for side, prefix in SIDES.items():
                 label = QtWidgets.QLabel("unknown | UR reverse missing")
+                label.setWordWrap(True)
                 self.status_labels[(robot, side)] = label
                 layout.addRow(f"{robot}/{prefix}", label)
         return box
@@ -2352,6 +2354,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
         for robot in ROBOTS:
             for side in SIDES:
                 self.arm_status[(robot, side)] = "unknown"
+                self.arm_feedback[(robot, side)] = ("", False)
                 self.ur_reverse_ready[(robot, side)] = False
             if robot not in selected:
                 for source in ("mir", "mur"):
@@ -2371,6 +2374,11 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.arm_status[(robot, side)] = status
         self.refresh_status_label(robot, side)
 
+    def set_arm_feedback(self, robot, side, message, error=False):
+        self.arm_feedback[(robot, side)] = (message, error)
+        self.refresh_status_label(robot, side)
+        self.append_log(f"[gui] {robot}/{SIDES[side]}: {message}")
+
     def set_ur_reverse_ready(self, robot, side, ready, reason):
         key = (robot, side)
         if self.ur_reverse_ready.get(key) == ready:
@@ -2388,7 +2396,13 @@ class MurBaseGui(QtWidgets.QMainWindow):
         )
         label = self.status_labels.get((robot, side))
         if label is not None:
-            label.setText(f"{gate_status} | {reverse_status}")
+            feedback, error = self.arm_feedback.get((robot, side), ("", False))
+            label.setText(
+                f"{gate_status} | {reverse_status}"
+                + (f" | {feedback}" if feedback else "")
+            )
+            label.setToolTip(feedback)
+            label.setStyleSheet("color: #b42318; font-weight: bold;" if error else "")
 
     def refresh_status_labels(self):
         for robot in ROBOTS:
@@ -2572,6 +2586,10 @@ class MurBaseGui(QtWidgets.QMainWindow):
             output.append(data)
             for line in data.splitlines():
                 self.append_log(f"[{name}] {line}")
+                if ":home_" in name:
+                    robot, action = name.split(":", 1)
+                    if action in ("home_l", "home_r"):
+                        self._observe_home_line(robot, action[-1], line)
 
         process.readyReadStandardOutput.connect(read_output)
         process.finished.connect(
@@ -2594,7 +2612,27 @@ class MurBaseGui(QtWidgets.QMainWindow):
                 robot = tag.split(":", 1)[0] if ":" in tag else self.object_host()
                 self._observe_hardware_line(robot, line)
 
+    def _observe_home_line(self, robot, side, line):
+        if "Planning UR_arm_" in line:
+            self.set_arm_feedback(robot, side, "Home: lade MoveIt und plane")
+        elif "Planning succeeded; executing trajectory" in line:
+            self.set_arm_feedback(robot, side, "Home: Trajektorie wird ausgeführt")
+        elif "Completed trajectory execution with status SUCCEEDED" in line:
+            self.set_arm_feedback(robot, side, "Home: Ziel erreicht")
+        elif "Completed trajectory execution with status" in line:
+            self.set_arm_feedback(robot, side, "Home: Ausführung fehlgeschlagen; Log prüfen", True)
+
     def _observe_hardware_line(self, robot, line):
+        for side, prefix in SIDES.items():
+            if f"[{prefix}_startup_enable]" not in line:
+                continue
+            if "UR SetMode failed:" in line:
+                self.set_arm_feedback(robot, side, "UR-Start fehlgeschlagen: Bremsen nicht gelöst", True)
+            elif "UR Dashboard play failed:" in line:
+                self.set_arm_feedback(robot, side, "UR-Programm konnte nicht gestartet werden", True)
+            elif "UR Dashboard reports program_running=true" in line or "UR program is already running" in line:
+                self.set_arm_feedback(robot, side, "UR-Programm läuft")
+            break
         if UR_REVERSE_READY_TEXT in line:
             for side, prefix in SIDES.items():
                 if prefix in line:
@@ -2756,6 +2794,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
         for robot in self.selected_robots():
             for side in self.selected_sides():
                 self.ur_reverse_ready[(robot, side)] = False
+                self.arm_feedback[(robot, side)] = ("", False)
                 self.refresh_status_label(robot, side)
             self._start_hardware_after_preflight(robot)
 
@@ -2815,8 +2854,8 @@ class MurBaseGui(QtWidgets.QMainWindow):
             hosts.append("UR10_r")
         return hosts
 
-    def _ur_safety_check_command(self, robot, clear=False):
-        hosts = self._selected_ur_hosts()
+    def _ur_safety_check_command(self, robot, clear=False, hosts=None):
+        hosts = self._selected_ur_hosts() if hosts is None else hosts
         script = self.remote_ur_dashboard_safety_check_script()
         args = [
             "python3",
@@ -3546,6 +3585,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
         robots = list(self.selected_robots())
         generations = {}
         for robot in robots:
+            self.set_arm_feedback(robot, side, "Home: prüfe UR-Sicherheit")
             if self.freedrive_active.get((robot, side), False):
                 self.append_log(f"[gui] Home {robot}/{prefix}: disabling freedrive first")
                 self.ros_worker.switch_freedrive(
@@ -3579,21 +3619,86 @@ class MurBaseGui(QtWidgets.QMainWindow):
             ):
                 self.append_log(f"[gui] Home {robot}/{prefix} canceled before start")
                 continue
-            cmd = (
-                self.remote_setup_prefix()
-                + "exec timeout --signal=TERM --kill-after=5s 90s "
-                + "ros2 run match_mur_gui move_arm_to_named_pose.py --ros-args "
-                + f"-p robot_name:={robot} "
-                + f"-p robot_profile:={self.robot_profile(robot)} "
-                + f"-p arm:={side} "
-                + f"-p group:=UR_arm_{side} "
-                + "-p named_pose:=Home_custom "
-                + f"-p velocity_scaling:={self.moveit_velocity_scaling():.3f}"
+
+            def after_safety(exit_code, _status, output, current_robot=robot,
+                             current_generation=generation):
+                if current_generation is not None and not self._arm_motion_generation_is_current(
+                    current_robot, side, current_generation
+                ):
+                    return
+                try:
+                    payload = self._parse_ur_safety_payload(output)
+                except (ValueError, json.JSONDecodeError):
+                    self.set_arm_feedback(
+                        current_robot, side, "Home gesperrt: UR-Status nicht lesbar", True
+                    )
+                    return
+                arm = next(
+                    (item for item in payload.get("arms", []) if item.get("host") == prefix),
+                    None,
+                )
+                if exit_code != 0 or arm is None or not arm.get("reachable") or arm.get("blocked"):
+                    reasons = list(arm.get("blocking_reasons", [])) if arm else []
+                    if arm and arm.get("error"):
+                        reasons.append(arm["error"])
+                    reason = ", ".join(reasons) or "UR-Dashboard nicht erreichbar"
+                    self.set_arm_feedback(current_robot, side, f"Home gesperrt: {reason}", True)
+                    return
+                self._launch_home_process(current_robot, side, current_generation)
+
+            self.start_captured_process(
+                self.process_key(robot, f"home_safety_{side}"),
+                self._ur_safety_check_command(robot, clear=False, hosts=[prefix]),
+                on_finished=after_safety,
             )
-            self.start_process(
-                self.process_key(robot, f"home_{side}"),
-                self.remote_command(robot, cmd),
-            )
+
+    def _launch_home_process(self, robot, side, generation):
+        if generation is not None and not self._arm_motion_generation_is_current(
+            robot, side, generation
+        ):
+            return
+        cmd = (
+            self.remote_setup_prefix()
+            + "exec timeout --signal=TERM --kill-after=5s 90s "
+            + '"$(ros2 pkg prefix match_mur_gui)/lib/match_mur_gui/move_arm_to_named_pose.py" --ros-args '
+            + f"-p robot_name:={robot} "
+            + f"-p robot_profile:={self.robot_profile(robot)} "
+            + f"-p arm:={side} "
+            + f"-p group:=UR_arm_{side} "
+            + "-p named_pose:=Home_custom "
+            + f"-p velocity_scaling:={self.moveit_velocity_scaling():.3f}"
+        )
+
+        def finished(exit_code, _status, output, current_robot=robot):
+            succeeded = "Completed trajectory execution with status SUCCEEDED" in output
+            if succeeded and exit_code == 0:
+                self.set_arm_feedback(current_robot, side, "Home abgeschlossen")
+            elif succeeded:
+                self.set_arm_feedback(
+                    current_robot, side,
+                    f"Home erreicht; MoveIt beim Beenden abgestürzt (Code {exit_code})",
+                    True,
+                )
+            elif exit_code == 124:
+                self.set_arm_feedback(
+                    current_robot, side, "Home: Zeitlimit erreicht; UR-Status prüfen", True
+                )
+            else:
+                self.set_arm_feedback(
+                    current_robot, side, f"Home fehlgeschlagen (Code {exit_code})", True
+                )
+
+        process_key = self.process_key(robot, f"home_{side}")
+        running = self.processes.get(process_key)
+        if running is not None and running.state() != QtCore.QProcess.NotRunning:
+            self.set_arm_feedback(robot, side, "Home bereits aktiv; Ergebnis abwarten", True)
+            return
+        self.set_arm_feedback(robot, side, "Home: starte MoveIt (ca. 10 s)")
+        self.start_captured_process(
+            process_key,
+            self.remote_command(robot, cmd),
+            on_finished=finished,
+        )
 
     def stop_managed_processes(self):
         self.stop_module_motion_like_actions()
