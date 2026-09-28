@@ -23,10 +23,10 @@ from controller_manager_msgs.srv import (
 from geometry_msgs.msg import Pose, PoseStamped, Twist, TwistStamped
 from lifecycle_msgs.msg import State, TransitionEvent
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
-from sensor_msgs.msg import BatteryState, JointState
+from sensor_msgs.msg import BatteryState
 from std_msgs.msg import Bool, Float32
 from std_srvs.srv import Trigger
-from ewellix_interfaces.msg import Command as EwellixCommand
+from ewellix_interfaces.msg import Command as EwellixCommand, State as EwellixState
 from mir_srvs.srv import ColorRGB
 
 from match_mur_gui.alignment import plane_alignment, plane_alignments
@@ -68,6 +68,8 @@ UR_REVERSE_WAIT_SEC = 18.0
 UR_REVERSE_STABLE_SEC = 1.2
 UR_READY_RETRY_LIMIT = 1
 ARM_TWIST_SUBSCRIBER_WARN_SEC = 2.0
+LIFT_TICKS_PER_METER = 3225.0  # mur_620.launch.py lift_conversion default
+LIFT_STATE_TIMEOUT_SEC = 2.0
 ARM_STOP_ZERO_TWIST_COUNT = 10
 ARM_STOP_ZERO_TWIST_INTERVAL_MS = 100
 MOTION_CONTROLLERS = [
@@ -223,8 +225,8 @@ class RosWorker(QtCore.QThread):
         self._mir_pose_subs = {}
         self._mir_poses = {}
         self._mir_twist_last_warn = {}
-        self._joint_positions = {}
-        self._joint_state_sub = None
+        self._lift_heights = {}
+        self._lift_state_subs = []
         self._battery_subs = []
         self._previous_freedrive_controllers = {}
         self._freedrive_enable_pubs = {}
@@ -237,9 +239,7 @@ class RosWorker(QtCore.QThread):
     def run(self):
         rclpy.init(args=None)
         self._node = rclpy.create_node("mur_gui")
-        self._joint_state_sub = self._node.create_subscription(
-            JointState, "/joint_states", self._on_joint_states, 50
-        )
+        self._configure_lift_subscriptions(self.robot_names)
         self._configure_battery_subscriptions(self.robot_names)
         self._ready.set()
         self.log.emit("[ros] GUI ROS helper started")
@@ -268,7 +268,28 @@ class RosWorker(QtCore.QThread):
     def set_robot_names(self, robot_names):
         self.robot_names = list(robot_names or ["mur620d"])
         if self._ready.wait(timeout=1.0):
+            self._configure_lift_subscriptions(self.robot_names)
             self._configure_battery_subscriptions(self.robot_names)
+
+    def _configure_lift_subscriptions(self, robot_names):
+        # Both robots publish identical lift joint names on /joint_states.
+        with self._lock:
+            if self._node is None:
+                return
+            for sub in self._lift_state_subs:
+                self._node.destroy_subscription(sub)
+            self._lift_state_subs = []
+            self._lift_heights.clear()
+            for robot_name in robot_names:
+                for side in ("l", "r"):
+                    topic = f"/{robot_name}/ewellix_lift_{side}/state"
+                    sub = self._node.create_subscription(
+                        EwellixState,
+                        topic,
+                        partial(self._on_lift_state, robot_name, side),
+                        10,
+                    )
+                    self._lift_state_subs.append(sub)
 
     def _configure_battery_subscriptions(self, robot_names):
         with self._lock:
@@ -301,24 +322,20 @@ class RosWorker(QtCore.QThread):
             percentage *= 100.0
         self.battery_status.emit(robot_name, "mir", percentage, math.isfinite(percentage))
 
-    def _on_joint_states(self, msg):
+    def _on_lift_state(self, robot_name, side, msg):
+        positions = [position for position in msg.actual_positions[:2] if position >= 0]
+        if not positions:
+            return
+        height = sum(positions) / len(positions) / LIFT_TICKS_PER_METER
         with self._lock:
-            for name, position in zip(msg.name, msg.position):
-                self._joint_positions[name] = float(position)
+            self._lift_heights[(robot_name, side)] = (height, time.monotonic())
 
     def current_lift_height(self, robot_name, side):
-        candidates = [
-            "right_lift_joint" if side == "r" else "left_lift_joint",
-            f"{robot_name}/right_lift_joint" if side == "r" else f"{robot_name}/left_lift_joint",
-            f"{robot_name}/UR10_{side}/right_lift_joint"
-            if side == "r"
-            else f"{robot_name}/UR10_{side}/left_lift_joint",
-        ]
         with self._lock:
-            for name in candidates:
-                if name in self._joint_positions:
-                    return self._joint_positions[name]
-        return None
+            state = self._lift_heights.get((robot_name, side))
+        if state is None or time.monotonic() - state[1] > LIFT_STATE_TIMEOUT_SEC:
+            return None
+        return state[0]
 
     def call_trigger(self, service_name, label):
         if not self._ready.wait(timeout=1.0):
@@ -1386,7 +1403,7 @@ class ManipulatorJogDialog(QtWidgets.QDialog):
         if current is None:
             self.main_window.append_log(
                 f"[gui] Refusing lift jog {self.robot_name()}/{SIDES[self.side]}: "
-                "no lift joint state on /joint_states"
+                "no fresh state on the selected lift topic"
             )
             return False
         target = current + direction * self.lift_step.value()
@@ -3130,6 +3147,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
             "launch_bms:=true",
             "bms_can_interface:=can0",
             "bms_can_bitrate:=250000",
+            f"lift_conversion:={LIFT_TICKS_PER_METER}",
             "auto_switch_moveit_controllers:=true",
             "launch_moveit_rviz:=false",
         ]
