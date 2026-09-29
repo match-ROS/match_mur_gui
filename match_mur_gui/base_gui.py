@@ -2022,6 +2022,9 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.log_filter_buttons = {}
         self.gui_log_path = self._create_gui_log_file()
 
+        # MuR620c's DDS multicast discovery is unreliable from the GUI host.
+        # An explicit peer also covers CLI processes started from this GUI.
+        os.environ.setdefault("ROS_STATIC_PEERS", "mur620c")
         self.ros_worker = RosWorker(["mur620d"])
         self.ros_worker.log.connect(self.append_log)
         self.ros_worker.freedrive_status.connect(self.update_freedrive_status)
@@ -2741,6 +2744,17 @@ class MurBaseGui(QtWidgets.QMainWindow):
                     "--exclude=.colcon/",
                     "--exclude=.git/",
                 ]
+                # Empty local UR submodules must not delete the remote files used by
+                # symlink-installed UR packages. Sync them only when initialized here.
+                ur_submodules = (
+                    "Universal_Robots_Client_Library",
+                    "Universal_Robots_ROS2_Driver",
+                    "Universal_Robots_ROS2_GZ_Simulation",
+                )
+                for submodule in ur_submodules:
+                    relative_path = f"match_mobile_robotics_jazzy/ur_robot/{submodule}"
+                    if not os.path.exists(os.path.join(WS, "src", relative_path, ".git")):
+                        excludes.append(f"--exclude=/{relative_path}/")
                 rsync_cmd = " ".join(
                     [
                         "rsync",
