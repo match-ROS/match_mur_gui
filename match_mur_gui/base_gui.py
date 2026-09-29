@@ -2160,9 +2160,19 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.mir_enabled_check = QtWidgets.QCheckBox("mir")
         self.mir_enabled_check.setChecked(False)
         self.mir_enabled_check.setToolTip("Startet den MiR ROS2/ROS1 Bridge-Treiber beim Hardware-Start")
+        self.mir_camera_check = QtWidgets.QCheckBox("MiR cameras (2 Hz)")
+        self.mir_camera_check.setChecked(False)
+        self.mir_camera_check.setToolTip("Bringt die beiden MiR RGB- und Tiefenkameras als ROS-2-Topics ein")
+        self.mir_camera_check.toggled.connect(
+            lambda checked: self.mir_enabled_check.setChecked(True) if checked else None
+        )
+        self.mir_enabled_check.toggled.connect(
+            lambda checked: self.mir_camera_check.setChecked(False) if not checked else None
+        )
         layout.addRow(self.arm_r)
         layout.addRow(self.arm_l)
         layout.addRow(self.mir_enabled_check)
+        layout.addRow(self.mir_camera_check)
         return box
 
     def _build_options_box(self):
@@ -3141,6 +3151,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
             f"launch_ur_r:={'true' if self.arm_r.isChecked() else 'false'}",
             f"launch_ur_l:={'true' if self.arm_l.isChecked() else 'false'}",
             f"launch_mir:={'true' if self.launch_mir_enabled() else 'false'}",
+            f"launch_mir_cameras:={'true' if self.mir_camera_check.isChecked() else 'false'}",
             f"integrated_controller_enable_collision_avoidance:={'true' if self.opt_collision.isChecked() else 'false'}",
             f"integrated_controller_publish_collision_markers:={'true' if self.opt_markers.isChecked() else 'false'}",
             f"launch_moveit:={'true' if self.opt_moveit.isChecked() else 'false'}",
