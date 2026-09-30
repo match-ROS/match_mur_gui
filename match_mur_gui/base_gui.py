@@ -258,6 +258,9 @@ class RosWorker(QtCore.QThread):
                 self._publish_freedrive_keepalives()
         except (KeyboardInterrupt, ExternalShutdownException):
             pass
+        except RuntimeError:
+            if rclpy.ok():
+                raise
         finally:
             if rclpy.ok():
                 self._stop_all_freedrive_keepalives()
