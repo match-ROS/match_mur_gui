@@ -85,6 +85,13 @@ MOTION_CONTROLLERS = [
     FREEDRIVE_CONTROLLER,
 ]
 LOG_LEVELS = ("error", "warning", "info")
+ROS_LOG_LEVEL_RE = re.compile(r"\[(fatal|error|warn|warning|info|debug)\]")
+MOVEIT_FALLBACK_WARNING_RE = re.compile(
+    r"^\[mur620[ab]:hardware\] WARNING:root:"
+    r"(?:\x1b\[[0-9;]*m)?Cannot infer (?:URDF|SRDF) from "
+    r"`[^`]+/mur_moveit_config`\. -- using config/mur620\.(?:urdf|srdf)"
+    r"(?:\x1b\[[0-9;]*m)?$"
+)
 ERROR_LOG_RE = re.compile(
     r"\[(error|fatal)\]|"
     r"\b(error|failed|failure|exception|traceback|could not)\b"
@@ -1952,6 +1959,9 @@ class MurGuiContext:
     def selected_robots(self):
         return self.window.selected_robots()
 
+    def checked_robots(self):
+        return self.window.checked_robots()
+
     def selected_sides(self):
         return self.window.selected_sides()
 
@@ -1984,6 +1994,12 @@ class MurGuiContext:
 
     def add_bottom_widget(self, widget):
         self.window.bottom_layout.addWidget(widget)
+        return widget
+
+    def add_panel(self, widget):
+        self.window.extension_layout.addWidget(widget)
+        self.window.extension_container.show()
+        self.window.view_log_splitter.setSizes([300, 200])
         return widget
 
     def add_status_row(self, label_text, widget):
@@ -2048,6 +2064,10 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.section_layout.setVerticalSpacing(8)
         self._sections = {}
         root.addWidget(self.section_container)
+        self.extension_container = QtWidgets.QWidget()
+        self.extension_layout = QtWidgets.QVBoxLayout(self.extension_container)
+        self.extension_layout.setContentsMargins(0, 0, 0, 0)
+        self.extension_container.hide()
 
         general_buttons = [
             self.add_action_button("Connect", self.connect_selected_robots, section="General"),
@@ -2093,7 +2113,12 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.terminal.setReadOnly(True)
         self.terminal.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
         self.terminal.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont))
-        root.addWidget(self.terminal, 1)
+        self.view_log_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.view_log_splitter.addWidget(self.extension_container)
+        self.view_log_splitter.addWidget(self.terminal)
+        self.view_log_splitter.setStretchFactor(0, 3)
+        self.view_log_splitter.setStretchFactor(1, 2)
+        root.addWidget(self.view_log_splitter, 1)
 
         self.bottom_layout = QtWidgets.QHBoxLayout()
         root.addLayout(self.bottom_layout)
@@ -2305,12 +2330,14 @@ class MurBaseGui(QtWidgets.QMainWindow):
     def remote_ws(self):
         return self.remote_ws_edit.text().strip() or REMOTE_WS_DEFAULT
 
-    def selected_robots(self):
-        robots = [
+    def checked_robots(self):
+        return [
             robot for robot in ROBOTS
             if self.robot_checks.get(robot) is not None and self.robot_checks[robot].isChecked()
         ]
-        return robots or ["mur620d"]
+
+    def selected_robots(self):
+        return self.checked_robots() or ["mur620d"]
 
     def object_host(self):
         selected = self.selected_robots()
@@ -2508,6 +2535,8 @@ class MurBaseGui(QtWidgets.QMainWindow):
 
     def append_log(self, text):
         line = text.rstrip()
+        if MOVEIT_FALLBACK_WARNING_RE.fullmatch(line):
+            return
         level = self._log_level(line)
         self.log_entries.append((level, line))
         terminal = getattr(self, "terminal", None)
@@ -2518,6 +2547,18 @@ class MurBaseGui(QtWidgets.QMainWindow):
 
     def _log_level(self, line):
         lower = line.lower()
+        ros_level = ROS_LOG_LEVEL_RE.search(lower)
+        if ros_level:
+            level = ros_level.group(1)
+            if level in ("fatal", "error"):
+                return "error"
+            if level in ("warn", "warning"):
+                return "warning"
+            return "info"
+        if "MUR_BMS_CAN:" in line and "can state ERROR-ACTIVE" in line:
+            return "info"
+        if re.search(r'"error":\s*""\s*,?$', lower):
+            return "info"
         if ERROR_LOG_RE.search(lower):
             return "error"
         if WARNING_LOG_RE.search(lower):
@@ -3777,6 +3818,18 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.stop_managed_processes()
         for module in self.modules:
             module.on_shutdown()
+        # Remote cleanup commands are started by stop_managed_processes().
+        # Let them finish (or stop them) before their log callbacks lose the UI.
+        cleanup_deadline = time.monotonic() + 3.0
+        for process in list(self.processes.values()):
+            if process.state() == QtCore.QProcess.NotRunning:
+                continue
+            remaining_ms = max(0, int((cleanup_deadline - time.monotonic()) * 1000))
+            if not process.waitForFinished(remaining_ms):
+                process.terminate()
+                if not process.waitForFinished(500):
+                    process.kill()
+                    process.waitForFinished(500)
         self.ros_worker.shutdown()
         self.ros_worker.wait(1500)
         super().closeEvent(event)
