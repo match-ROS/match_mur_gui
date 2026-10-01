@@ -25,7 +25,7 @@ from lifecycle_msgs.msg import State, TransitionEvent
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from sensor_msgs.msg import BatteryState
 from std_msgs.msg import Bool, Float32
-from std_srvs.srv import Trigger
+from std_srvs.srv import SetBool, Trigger
 from ewellix_interfaces.msg import Command as EwellixCommand, State as EwellixState
 from mir_srvs.srv import ColorRGB
 
@@ -215,6 +215,7 @@ class BatteryBadge(QtWidgets.QWidget):
 
 class RosWorker(QtCore.QThread):
     log = QtCore.pyqtSignal(str)
+    set_bool_result = QtCore.pyqtSignal(str, bool, bool, str)
     freedrive_status = QtCore.pyqtSignal(str, str, bool, str)
     battery_status = QtCore.pyqtSignal(str, str, float, bool)
 
@@ -366,6 +367,34 @@ class RosWorker(QtCore.QThread):
                 )
             except Exception as exc:  # noqa: BLE001
                 self.log.emit(f"[ros] {label}: failed: {exc}")
+
+        future.add_done_callback(done)
+
+    def call_set_bool(self, service_name, enabled):
+        if not self._ready.wait(timeout=1.0) or self._node is None:
+            self.set_bool_result.emit(service_name, enabled, False, 'ROS helper not ready')
+            return
+        with self._lock:
+            client = self._node.create_client(SetBool, service_name)
+        if not client.wait_for_service(timeout_sec=0.5):
+            self._node.destroy_client(client)
+            self.set_bool_result.emit(service_name, enabled, False, 'service unavailable')
+            return
+        request = SetBool.Request()
+        request.data = bool(enabled)
+        future = client.call_async(request)
+
+        def done(done_future):
+            try:
+                result = done_future.result()
+                self.set_bool_result.emit(
+                    service_name, enabled, bool(result.success), result.message
+                )
+            except Exception as exc:
+                self.set_bool_result.emit(service_name, enabled, False, str(exc))
+            finally:
+                if self._node is not None:
+                    self._node.destroy_client(client)
 
         future.add_done_callback(done)
 
@@ -2001,8 +2030,10 @@ class MurGuiContext:
 
     def add_panel(self, widget):
         self.window.extension_layout.addWidget(widget)
+        self.window._set_section_columns(2)
         self.window.extension_container.show()
-        self.window.view_log_splitter.setSizes([300, 200])
+        self.window.work_area_splitter.setSizes([760, 430])
+        self.window.view_log_splitter.setSizes([420, 150])
         return widget
 
     def add_status_row(self, label_text, widget):
@@ -2024,7 +2055,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.modules = list(modules or [])
         self.module_context = MurGuiContext(self)
         self.setWindowTitle(window_title)
-        self.resize(1180, 780)
+        self.resize(1300, 780)
         self.processes = {}
         self._arm_motion_generation = {}
         self.arm_status = {}
@@ -2066,7 +2097,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.section_layout.setHorizontalSpacing(10)
         self.section_layout.setVerticalSpacing(8)
         self._sections = {}
-        root.addWidget(self.section_container)
+        self._section_columns = 4
         self.extension_container = QtWidgets.QWidget()
         self.extension_layout = QtWidgets.QVBoxLayout(self.extension_container)
         self.extension_layout.setContentsMargins(0, 0, 0, 0)
@@ -2116,11 +2147,17 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.terminal.setReadOnly(True)
         self.terminal.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
         self.terminal.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont))
+        self.work_area_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.work_area_splitter.addWidget(self.section_container)
+        self.work_area_splitter.addWidget(self.extension_container)
+        self.work_area_splitter.setChildrenCollapsible(False)
+        self.work_area_splitter.setStretchFactor(0, 3)
+        self.work_area_splitter.setStretchFactor(1, 2)
         self.view_log_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        self.view_log_splitter.addWidget(self.extension_container)
+        self.view_log_splitter.addWidget(self.work_area_splitter)
         self.view_log_splitter.addWidget(self.terminal)
         self.view_log_splitter.setStretchFactor(0, 3)
-        self.view_log_splitter.setStretchFactor(1, 2)
+        self.view_log_splitter.setStretchFactor(1, 1)
         root.addWidget(self.view_log_splitter, 1)
 
         self.bottom_layout = QtWidgets.QHBoxLayout()
@@ -2219,7 +2256,11 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.opt_moveit = self._check("Launch MoveIt", True)
         self.moveit_speed_label = QtWidgets.QLabel("MoveIt speed: 20%")
         self.moveit_speed_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.moveit_speed_slider.setFixedWidth(180)
+        # Fill the column established by the option texts without contributing
+        # the slider's own preferred width to the grid's size hint.
+        self.moveit_speed_slider.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed
+        )
         self.moveit_speed_slider.setRange(1, 100)
         self.moveit_speed_slider.setValue(20)
         self.moveit_speed_slider.valueChanged.connect(self.update_moveit_speed_label)
@@ -2258,6 +2299,9 @@ class MurBaseGui(QtWidgets.QMainWindow):
         for robot in ROBOTS:
             for side, prefix in SIDES.items():
                 label = QtWidgets.QLabel("UR reverse missing")
+                # Keep the basic connection status readable on a single line;
+                # longer diagnostic messages can still wrap.
+                label.setMinimumWidth(label.fontMetrics().horizontalAdvance(label.text()))
                 label.setWordWrap(True)
                 self.status_labels[(robot, side)] = label
                 layout.addRow(f"{robot}/{prefix}", label)
@@ -2306,11 +2350,24 @@ class MurBaseGui(QtWidgets.QMainWindow):
         layout.setHorizontalSpacing(6)
         layout.setVerticalSpacing(6)
         index = len(self._sections)
-        self.section_layout.addWidget(box, index // 4, index % 4)
-        self.section_layout.setColumnStretch(index % 4, 1)
+        self.section_layout.addWidget(
+            box, index // self._section_columns, index % self._section_columns
+        )
+        self.section_layout.setColumnStretch(index % self._section_columns, 1)
         state = {"box": box, "layout": layout, "count": 0}
         self._sections[title] = state
         return state
+
+    def _set_section_columns(self, columns):
+        if columns == self._section_columns:
+            return
+        self._section_columns = columns
+        for index, state in enumerate(self._sections.values()):
+            box = state["box"]
+            self.section_layout.removeWidget(box)
+            self.section_layout.addWidget(box, index // columns, index % columns)
+        for column in range(4):
+            self.section_layout.setColumnStretch(column, 1 if column < columns else 0)
 
     def _add_button_to_section(self, button, section):
         state = self._section_state(section)
