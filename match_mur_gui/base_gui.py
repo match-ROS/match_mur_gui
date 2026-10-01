@@ -2057,8 +2057,8 @@ class MurBaseGui(QtWidgets.QMainWindow):
         top = QtWidgets.QHBoxLayout()
         root.addLayout(top)
         top.addWidget(self._build_robot_box())
-        top.addWidget(self._build_options_box(), 1)
-        top.addWidget(self._build_status_box())
+        top.addWidget(self._build_options_box())
+        top.addWidget(self._build_status_box(), 1)
 
         self.section_container = QtWidgets.QWidget()
         self.section_layout = QtWidgets.QGridLayout(self.section_container)
@@ -2219,6 +2219,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.opt_moveit = self._check("Launch MoveIt", True)
         self.moveit_speed_label = QtWidgets.QLabel("MoveIt speed: 20%")
         self.moveit_speed_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.moveit_speed_slider.setFixedWidth(180)
         self.moveit_speed_slider.setRange(1, 100)
         self.moveit_speed_slider.setValue(20)
         self.moveit_speed_slider.valueChanged.connect(self.update_moveit_speed_label)
@@ -2256,7 +2257,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.status_labels = {}
         for robot in ROBOTS:
             for side, prefix in SIDES.items():
-                label = QtWidgets.QLabel("unknown | UR reverse missing")
+                label = QtWidgets.QLabel("UR reverse missing")
                 label.setWordWrap(True)
                 self.status_labels[(robot, side)] = label
                 layout.addRow(f"{robot}/{prefix}", label)
@@ -2450,19 +2451,26 @@ class MurBaseGui(QtWidgets.QMainWindow):
 
     def refresh_status_label(self, robot, side):
         gate_status = self.arm_status.get((robot, side), "unknown")
-        reverse_status = (
-            "UR reverse OK" if self.ur_reverse_ready.get((robot, side), False)
-            else "UR reverse missing"
-        )
+        reverse_ready = self.ur_reverse_ready.get((robot, side), False)
+        reverse_status = "UR reverse OK" if reverse_ready else "UR reverse missing"
         label = self.status_labels.get((robot, side))
         if label is not None:
             feedback, error = self.arm_feedback.get((robot, side), ("", False))
-            label.setText(
-                f"{gate_status} | {reverse_status}"
-                + (f" | {feedback}" if feedback else "")
-            )
-            label.setToolTip(feedback)
-            label.setStyleSheet("color: #b42318; font-weight: bold;" if error else "")
+            details = [reverse_status]
+            if gate_status and gate_status != "unknown":
+                details.append(gate_status)
+            if feedback:
+                details.append(feedback)
+            label.setToolTip("\n".join(details))
+            if error:
+                label.setText(" | ".join(details))
+                label.setStyleSheet("color: #b42318; font-weight: bold;")
+            elif reverse_ready:
+                label.setText("ready")
+                label.setStyleSheet("color: #15803d; font-weight: bold;")
+            else:
+                label.setText(" | ".join(details))
+                label.setStyleSheet("")
 
     def refresh_status_labels(self):
         for robot in ROBOTS:
