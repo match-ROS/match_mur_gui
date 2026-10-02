@@ -2778,7 +2778,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
 
     def _observe_home_line(self, robot, side, line):
         if "Planning UR_arm_" in line:
-            self.set_arm_feedback(robot, side, "Home: lade MoveIt und plane")
+            self.set_arm_feedback(robot, side, "Home: plane über MoveIt-Server")
         elif "Planning succeeded; executing trajectory" in line:
             self.set_arm_feedback(robot, side, "Home: Trajektorie wird ausgeführt")
         elif "Completed trajectory execution with status SUCCEEDED" in line:

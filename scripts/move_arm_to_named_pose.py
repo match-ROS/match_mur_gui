@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""Move one MuR620 UR arm to a MoveIt named pose."""
-
-import os
+"""Plan Home through the running move_group; execute with bounded cancellation."""
 import copy
+import math
+import signal
 import sys
 import time
-import traceback
-from pathlib import Path
+import xml.etree.ElementTree as ET
 
 import rclpy
-import yaml
-from ament_index_python.packages import get_package_share_directory
-from moveit.planning import MoveItPy
-from moveit_configs_utils import MoveItConfigsBuilder
+from action_msgs.msg import GoalStatus
+from moveit_msgs.action import ExecuteTrajectory
+from moveit_msgs.msg import Constraints, JointConstraint, MoveItErrorCodes
+from moveit_msgs.srv import GetMotionPlan
+from rcl_interfaces.srv import GetParameters
+from rclpy.action import ActionClient
 from rclpy.node import Node
+from ur_dashboard_msgs.srv import IsProgramRunning
 
 
 SIDES = {"r": "UR_arm_r", "l": "UR_arm_l"}
@@ -91,273 +93,159 @@ def get_robot_trajectory_msg(robot_trajectory):
     )
 
 
-def arm_controller_config(controller_namespace, use_lift=True):
-    controller_prefix = f"/{controller_namespace}" if controller_namespace else ""
-    left_controller = f"{controller_prefix}/moveit_joint_trajectory_controller_l"
-    right_controller = f"{controller_prefix}/moveit_joint_trajectory_controller_r"
-    left_lift_controller = f"{controller_prefix}/moveit_joint_trajectory_controller_lift_l"
-    right_lift_controller = f"{controller_prefix}/moveit_joint_trajectory_controller_lift_r"
-    left_joints = [
-        "UR10_l/shoulder_pan_joint",
-        "UR10_l/shoulder_lift_joint",
-        "UR10_l/elbow_joint",
-        "UR10_l/wrist_1_joint",
-        "UR10_l/wrist_2_joint",
-        "UR10_l/wrist_3_joint",
-    ]
-    right_joints = [
-        "UR10_r/shoulder_pan_joint",
-        "UR10_r/shoulder_lift_joint",
-        "UR10_r/elbow_joint",
-        "UR10_r/wrist_1_joint",
-        "UR10_r/wrist_2_joint",
-        "UR10_r/wrist_3_joint",
-    ]
-    config = {
-        "moveit_controller_manager": "moveit_simple_controller_manager/MoveItSimpleControllerManager",
-        "trajectory_execution": {
-            "allowed_execution_duration_scaling": 1.2,
-            "allowed_goal_duration_margin": 0.5,
-            "allowed_start_tolerance": 0.01,
-            "execution_duration_monitoring": False,
-        },
-        "moveit_simple_controller_manager": {
-            "controller_names": [
-                left_controller,
-                right_controller,
-                left_lift_controller,
-                right_lift_controller,
-            ],
-            left_controller: {
-                "action_ns": "follow_joint_trajectory",
-                "type": "FollowJointTrajectory",
-                "default": True,
-                "joints": left_joints,
-            },
-            right_controller: {
-                "action_ns": "follow_joint_trajectory",
-                "type": "FollowJointTrajectory",
-                "default": True,
-                "joints": right_joints,
-            },
-            left_lift_controller: {
-                "action_ns": "follow_joint_trajectory",
-                "type": "FollowJointTrajectory",
-                "default": True,
-                "joints": ["left_lift_joint"] + left_joints,
-            },
-            right_lift_controller: {
-                "action_ns": "follow_joint_trajectory",
-                "type": "FollowJointTrajectory",
-                "default": True,
-                "joints": ["right_lift_joint"] + right_joints,
-            },
-        },
-    }
-
-    if not use_lift:
-        controllers = config["moveit_simple_controller_manager"]
-        controllers["controller_names"] = [left_controller, right_controller]
-        del controllers[left_lift_controller]
-        del controllers[right_lift_controller]
-    return config
-
-
-def load_robot_profile(robot_profile):
-    mur_launch_hardware_path = get_package_share_directory("mur_launch_hardware")
-    profile_file = os.path.join(mur_launch_hardware_path, "config", "mur_robot_profiles.yaml")
-    with open(profile_file, "r", encoding="utf-8") as handle:
-        profiles = yaml.safe_load(handle) or {}
-    robots = profiles.get("robots", {})
-    if robot_profile not in robots:
-        raise RuntimeError(f"Robot profile '{robot_profile}' not found in {profile_file}")
-    return robots[robot_profile], mur_launch_hardware_path
-
-
-def resolve_profile_file(mur_launch_hardware_path, path):
-    if not path:
-        return ""
-    if os.path.isabs(path):
-        return path
-    return os.path.join(mur_launch_hardware_path, path)
-
-
-def robot_description_source(robot_name, robot_profile, ur_type):
-    mur_description_path = get_package_share_directory("mur_description")
-    xacro_file = os.path.join(mur_description_path, "urdf", "mur_620.gazebo.xacro")
-    profile, mur_launch_hardware_path = load_robot_profile(robot_profile)
-    arms = profile.get("arms", {})
-    left = arms.get("l", {})
-    right = arms.get("r", {})
-    home_custom_l_shoulder_pan = str(left.get("home_custom_shoulder_pan", "0.0"))
-    home_custom_r_shoulder_pan = str(right.get("home_custom_shoulder_pan", "0.0"))
-    robot_xacro_mappings = {
-        "tf_prefix": robot_name,
-        "tf_prefix_mir": robot_name,
-        "robot_namespace": robot_name,
-        "use_arms": "true",
-        "use_camera": "true",
-        "use_lidar": "true",
-        "use_lift": "true" if profile.get("use_lift", True) else "false",
-        "use_simple_collisions": "false",
-        "use_simple_visuals": "false",
-        "use_high_quality_visuals": "false",
-        "use_base_visual_mesh": "false",
-        "use_top_visual_mesh": "false",
-        "use_wheel_visual_mesh": "false",
-        "use_caster_visual_mesh": "false",
-        "use_lift_visual_mesh": "false",
-        "use_laser_visual_mesh": "false",
-        "ur_type": ur_type,
-        "ur_l_xyz": left.get("mount_xyz", "0 0 0"),
-        "ur_l_rpy": left.get("mount_rpy", "0 0 0"),
-        "ur_r_xyz": right.get("mount_xyz", "0 0 0"),
-        "ur_r_rpy": right.get("mount_rpy", "0 0 3.14159265359"),
-        "kinematics_params_l": resolve_profile_file(
-            mur_launch_hardware_path, left.get("kinematics_params_file", "")
-        ),
-        "kinematics_params_r": resolve_profile_file(
-            mur_launch_hardware_path, right.get("kinematics_params_file", "")
-        ),
-    }
-    srdf_xacro_mappings = {
-        "home_custom_l_shoulder_pan": home_custom_l_shoulder_pan,
-        "home_custom_r_shoulder_pan": home_custom_r_shoulder_pan,
-        "use_lift": robot_xacro_mappings["use_lift"],
-    }
-    return xacro_file, robot_xacro_mappings, srdf_xacro_mappings
+def named_pose_constraints(srdf, group, pose):
+    root = ET.fromstring(srdf)
+    state = next((s for s in root.findall("group_state")
+                  if s.get("group") == group and s.get("name") == pose), None)
+    if state is None:
+        raise ValueError(f"Named pose {group}/{pose} is missing in the running MoveIt SRDF")
+    constraints = Constraints(name=pose)
+    for joint in state.findall("joint"):
+        value = float(joint.attrib["value"])
+        if not math.isfinite(value):
+            raise ValueError("Non-finite named joint position")
+        constraints.joint_constraints.append(JointConstraint(
+            joint_name=joint.attrib["name"], position=value,
+            tolerance_above=0.001, tolerance_below=0.001, weight=1.0))
+    if not constraints.joint_constraints:
+        raise ValueError("Named pose contains no joints")
+    return constraints
 
 
 class MoveArmToNamedPose(Node):
     def __init__(self):
         super().__init__("move_arm_to_named_pose")
-        self.declare_parameter("robot_name", "mur620")
-        self.declare_parameter("robot_profile", "mur620d")
-        self.declare_parameter("ur_type", "ur10")
-        self.declare_parameter("arm", "r")
-        self.declare_parameter("group", "")
-        self.declare_parameter("named_pose", "Home_custom")
-        self.declare_parameter("velocity_scaling", 0.2)
-        self.declare_parameter("hold_duration", 0.8)
-        self.declare_parameter("node_name", "mur_home_moveit_py")
-        self.declare_parameter("wait_after_init", 1.0)
+        for name, value in (("robot_name", "mur620"), ("robot_profile", "mur620d"),
+                            ("arm", "r"), ("group", ""), ("named_pose", "Home_custom"),
+                            ("velocity_scaling", 0.2), ("hold_duration", 0.8)):
+            self.declare_parameter(name, value)
+        self.robot_name = self.get_parameter("robot_name").value
+        self.arm = self.get_parameter("arm").value
+        if self.arm not in SIDES:
+            raise ValueError("arm must be l or r")
+        self.group = self.get_parameter("group").value or SIDES[self.arm]
+        if self.group != SIDES[self.arm]:
+            raise ValueError("Planning group must match the selected arm")
+        self.named_pose = self.get_parameter("named_pose").value
+        speed = float(self.get_parameter("velocity_scaling").value)
+        hold = float(self.get_parameter("hold_duration").value)
+        if not math.isfinite(speed) or not math.isfinite(hold):
+            raise ValueError("Speed and hold duration must be finite")
+        self.scale = clamp(speed, 0.01, 1.0)
+        self.hold = max(0.0, hold)
+        ns = '/' + self.robot_name.strip('/')
+        self.parameters = self.create_client(GetParameters, ns + '/move_group/get_parameters')
+        self.planner = self.create_client(GetMotionPlan, ns + '/plan_kinematic_path')
+        self.ready = self.create_client(
+            IsProgramRunning, ns + f'/UR10_{self.arm}/dashboard_client/program_running')
+        self.executor_client = ActionClient(self, ExecuteTrajectory, ns + '/execute_trajectory')
+        self.active_goal = None
+        self.interrupted = False
+        # Leave time for cancellation before the GUI's outer 90 s process limit.
+        self.deadline = time.monotonic() + 70.0
 
-        self.robot_name = str(self.get_parameter("robot_name").value)
-        self.robot_profile = str(self.get_parameter("robot_profile").value)
-        self.ur_type = str(self.get_parameter("ur_type").value)
-        self.arm = str(self.get_parameter("arm").value)
-        self.group = str(self.get_parameter("group").value) or SIDES.get(self.arm, "UR_arm_r")
-        self.named_pose = str(self.get_parameter("named_pose").value)
-        self.velocity_scaling = clamp(float(self.get_parameter("velocity_scaling").value), 0.01, 1.0)
-        self.hold_duration = max(0.0, float(self.get_parameter("hold_duration").value))
-        self.node_name = str(self.get_parameter("node_name").value)
-        self.wait_after_init = float(self.get_parameter("wait_after_init").value)
+    def wait(self, future, timeout):
+        deadline = min(self.deadline, time.monotonic() + timeout)
+        while rclpy.ok() and not future.done():
+            if self.interrupted or time.monotonic() >= deadline:
+                raise RuntimeError("Home interrupted or timed out")
+            rclpy.spin_once(self, timeout_sec=0.05)
+        result = future.result()
+        if result is None:
+            raise RuntimeError("ROS request returned no result")
+        return result
 
-    def make_moveit_config(self):
-        robot_xacro_file, robot_xacro_mappings, srdf_xacro_mappings = robot_description_source(
-            self.robot_name, self.robot_profile, self.ur_type
-        )
-        virtual_joint_parent_frame = f"{self.robot_name}/base_footprint"
-        moveit_config = (
-            MoveItConfigsBuilder(robot_name="mur620", package_name="mur_moveit_config")
-            .robot_description(robot_xacro_file, robot_xacro_mappings)
-            .robot_description_semantic(
-                Path("srdf") / "mur620.srdf.xacro",
-                {
-                    "prefix": "UR10",
-                    "model_name": "mur620",
-                    "virtual_joint_parent_frame": virtual_joint_parent_frame,
-                    "home_custom_l_shoulder_pan": srdf_xacro_mappings[
-                        "home_custom_l_shoulder_pan"
-                    ],
-                    "home_custom_r_shoulder_pan": srdf_xacro_mappings[
-                        "home_custom_r_shoulder_pan"
-                    ],
-                    "use_lift": srdf_xacro_mappings["use_lift"],
-                },
-            )
-            .moveit_cpp(file_path="config/moveit_cpp.yaml")
-            .to_moveit_configs()
-            .to_dict()
-        )
-        moveit_config.update(
-            arm_controller_config(self.robot_name, robot_xacro_mappings["use_lift"] == "true")
-        )
-        moveit_config["use_sim_time"] = False
-        return moveit_config
+    def call(self, client, request, timeout=3.0):
+        if not client.wait_for_service(timeout_sec=2.0):
+            raise RuntimeError(f"Service unavailable: {client.srv_name}")
+        return self.wait(client.call_async(request), timeout)
+
+    def check_ready(self):
+        status = self.call(self.ready, IsProgramRunning.Request())
+        if not status.success or not status.program_running:
+            raise RuntimeError("UR External Control program is not running; refusing execution")
+
+    def cancel_active(self):
+        if self.active_goal is None:
+            return
+        future = self.active_goal.cancel_goal_async()
+        rclpy.spin_until_future_complete(self, future, timeout_sec=3.0)
+        if not future.done() or future.result() is None or not future.result().goals_canceling:
+            self.get_logger().error("Execution cancellation was not confirmed; check controller status")
+        else:
+            self.get_logger().warn("Execution cancellation accepted")
+        self.active_goal = None
 
     def run(self):
-        if self.arm not in SIDES:
-            self.get_logger().error(f"arm must be 'l' or 'r', got '{self.arm}'")
-            return 2
-
-        self.get_logger().info(
-            f"Planning {self.group} ({self.arm}) to named pose '{self.named_pose}' "
-            f"with profile '{self.robot_profile}', velocity_scaling={self.velocity_scaling:.2f}"
-        )
-        moveit = MoveItPy(node_name=self.node_name, config_dict=self.make_moveit_config())
-        if self.wait_after_init > 0.0:
-            time.sleep(self.wait_after_init)
-
-        planning_component = moveit.get_planning_component(self.group)
-        if not planning_component.set_goal_state(self.named_pose):
-            self.get_logger().error(
-                f"Failed to set goal state '{self.named_pose}' for group '{self.group}'"
-            )
-            return 3
-
-        start_state = planning_component.get_start_state()
-        plan_result = planning_component.plan()
-        error_code = getattr(plan_result.error_code, "val", 999)
-        if error_code != 1:
-            self.get_logger().error(
-                f"Planning failed for group '{self.group}' to '{self.named_pose}' "
-                f"with error code {error_code}"
-            )
-            return 4
-
-        before_msg = get_robot_trajectory_msg(plan_result.trajectory)
-        before_duration = (
-            duration_to_seconds(before_msg.joint_trajectory.points[-1].time_from_start)
-            if before_msg.joint_trajectory.points
-            else 0.0
-        )
-        scale_joint_trajectory_speed(
-            plan_result.trajectory,
-            self.velocity_scaling,
-            reference_state=start_state,
-            hold_duration=self.hold_duration,
-        )
-
-        trajectory_msg = get_robot_trajectory_msg(plan_result.trajectory)
-        points = trajectory_msg.joint_trajectory.points
-        duration = duration_to_seconds(points[-1].time_from_start) if points else 0.0
-        self.get_logger().info(
-            f"Planning succeeded; executing trajectory with {len(points)} points, "
-            f"duration={duration:.3f}s (unscaled={before_duration:.3f}s, "
-            f"velocity_scaling={self.velocity_scaling:.2f}, hold={self.hold_duration:.2f}s)"
-        )
-        execute_result = moveit.execute(plan_result.trajectory, controllers=[])
-        self.get_logger().info(
-            f"Execution request finished for {self.group} -> {self.named_pose}; "
-            f"result={execute_result}"
-        )
+        self.check_ready()
+        self.get_logger().info(f"Planning {self.group} to {self.named_pose} using running move_group")
+        params = self.call(self.parameters, GetParameters.Request(names=['robot_description_semantic']))
+        if not params.values or not params.values[0].string_value:
+            raise RuntimeError("Running move_group has no robot_description_semantic")
+        request = GetMotionPlan.Request()
+        request.motion_plan_request.group_name = self.group
+        request.motion_plan_request.pipeline_id = 'ompl'
+        request.motion_plan_request.allowed_planning_time = 5.0
+        request.motion_plan_request.num_planning_attempts = 1
+        request.motion_plan_request.start_state.is_diff = True
+        request.motion_plan_request.max_velocity_scaling_factor = 1.0
+        request.motion_plan_request.max_acceleration_scaling_factor = 1.0
+        request.motion_plan_request.goal_constraints = [named_pose_constraints(
+            params.values[0].string_value, self.group, self.named_pose)]
+        response = self.call(self.planner, request, timeout=15.0).motion_plan_response
+        if response.error_code.val != MoveItErrorCodes.SUCCESS:
+            raise RuntimeError(f"Planning failed: MoveIt error {response.error_code.val}")
+        trajectory = response.trajectory
+        if not trajectory.joint_trajectory.points:
+            raise RuntimeError("Planner returned an empty trajectory")
+        scale_joint_trajectory_speed(trajectory, self.scale, hold_duration=self.hold)
+        if not self.executor_client.wait_for_server(timeout_sec=3.0):
+            raise RuntimeError("MoveIt execute_trajectory server unavailable")
+        # Readiness can change during planning (as in the reported incident).
+        self.check_ready()
+        self.get_logger().info("Planning succeeded; executing trajectory via running move_group")
+        send = self.executor_client.send_goal_async(ExecuteTrajectory.Goal(trajectory=trajectory))
+        try:
+            self.active_goal = self.wait(send, 5.0)
+        except RuntimeError:
+            # If acknowledgement arrives late, cancel this goal before shutdown.
+            rclpy.spin_until_future_complete(self, send, timeout_sec=3.0)
+            if send.done() and send.result() is not None and send.result().accepted:
+                self.active_goal = send.result()
+            raise
+        if not self.active_goal.accepted:
+            self.active_goal = None
+            raise RuntimeError("MoveIt rejected execution")
+        result = self.wait(self.active_goal.get_result_async(), 60.0)
+        self.active_goal = None
+        if result.status != GoalStatus.STATUS_SUCCEEDED or result.result.error_code.val != MoveItErrorCodes.SUCCESS:
+            raise RuntimeError(f"Execution failed: action={result.status}, MoveIt={result.result.error_code.val}")
+        self.get_logger().info("Completed trajectory execution with status SUCCEEDED")
         return 0
 
 
 def main():
     rclpy.init()
-    node = MoveArmToNamedPose()
+    node = None
+    code = 1
     try:
-        exit_code = node.run()
-    except Exception as exc:  # noqa: BLE001
-        node.get_logger().error(f"Home move failed: {exc}\n{traceback.format_exc()}")
-        exit_code = 1
+        node = MoveArmToNamedPose()
+        signal.signal(signal.SIGTERM, lambda *_: setattr(node, 'interrupted', True))
+        signal.signal(signal.SIGINT, lambda *_: setattr(node, 'interrupted', True))
+        code = node.run()
+    except Exception as exc:
+        if node is not None:
+            node.get_logger().error(f"Home failed: {exc}")
+        else:
+            print(f"Home initialization failed: {exc}", file=sys.stderr)
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
-    sys.exit(exit_code)
+        if node is not None:
+            node.cancel_active()
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+    return code
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    sys.exit(main())
