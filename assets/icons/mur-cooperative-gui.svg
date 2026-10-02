@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>MuR Cooperative Handling</title>
+  <rect x="4" y="4" width="120" height="120" rx="27" fill="#1d4059"/>
+  <path d="M26 46h17l15 18-15 18H26M102 46H85L70 64l15 18h17" fill="none" stroke="#f4f8f9" stroke-linecap="round" stroke-linejoin="round" stroke-width="6"/>
+  <path d="M64 49l13 15-13 15-13-15z" fill="#6ed0bf"/>
+  <path d="M26 93h18m40 0h18" fill="none" stroke="#f4f8f9" stroke-linecap="round" stroke-width="6"/>
+</svg>

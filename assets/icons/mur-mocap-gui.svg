@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>MuR Mocap</title>
+  <rect x="4" y="4" width="120" height="120" rx="27" fill="#1d4059"/>
+  <path d="M64 35L35 91h58z" fill="none" stroke="#f4f8f9" stroke-linejoin="round" stroke-width="5"/>
+  <circle cx="64" cy="35" r="7" fill="#f4f8f9"/>
+  <circle cx="35" cy="91" r="7" fill="#f4f8f9"/>
+  <circle cx="93" cy="91" r="7" fill="#f4f8f9"/>
+  <circle cx="64" cy="68" r="12" fill="#1d4059" stroke="#6ed0bf" stroke-width="5"/>
+  <path d="M64 48v7m0 26v7M44 68h7m26 0h7" fill="none" stroke="#6ed0bf" stroke-linecap="round" stroke-width="4"/>
+</svg>

@@ -1344,6 +1344,13 @@ class ManipulatorJogDialog(QtWidgets.QDialog):
         self.lift_hold_timer.setInterval(250)
         self.lift_hold_timer.timeout.connect(self.repeat_lift_jog)
 
+        enable_cartesian = QtWidgets.QPushButton("Enable Cartesian control")
+        enable_cartesian.setToolTip("Activate Cartesian control and calibrate the force sensor at rest")
+        enable_cartesian.clicked.connect(
+            lambda: self.main_window.enable_cartesian_motion([(self.robot_name(), self.side)])
+        )
+        layout.addWidget(enable_cartesian)
+
         hint = QtWidgets.QLabel("Keys: arrows X/Y, PgUp/PgDn Z, M mode, Space stop")
         hint.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(hint)
@@ -2030,10 +2037,15 @@ class MurGuiContext:
 
     def add_panel(self, widget):
         self.window.extension_layout.addWidget(widget)
-        self.window._set_section_columns(2)
         self.window.extension_container.show()
-        self.window.work_area_splitter.setSizes([760, 430])
+        self.window._resize_work_area()
         self.window.view_log_splitter.setSizes([420, 150])
+        return widget
+
+    def add_module_tab(self, widget, title):
+        self.window.module_tabs.addTab(widget, title)
+        self.window.module_tabs.show()
+        self.window._resize_work_area()
         return widget
 
     def add_status_row(self, label_text, widget):
@@ -2091,13 +2103,10 @@ class MurBaseGui(QtWidgets.QMainWindow):
         top.addWidget(self._build_options_box())
         top.addWidget(self._build_status_box(), 1)
 
-        self.section_container = QtWidgets.QWidget()
-        self.section_layout = QtWidgets.QGridLayout(self.section_container)
-        self.section_layout.setContentsMargins(0, 0, 0, 0)
-        self.section_layout.setHorizontalSpacing(10)
-        self.section_layout.setVerticalSpacing(8)
+        self.section_container = QtWidgets.QTabWidget()
+        self.module_tabs = QtWidgets.QTabWidget()
+        self.module_tabs.hide()
         self._sections = {}
-        self._section_columns = 4
         self.extension_container = QtWidgets.QWidget()
         self.extension_layout = QtWidgets.QVBoxLayout(self.extension_container)
         self.extension_layout.setContentsMargins(0, 0, 0, 0)
@@ -2149,10 +2158,12 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.terminal.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont))
         self.work_area_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.work_area_splitter.addWidget(self.section_container)
+        self.work_area_splitter.addWidget(self.module_tabs)
         self.work_area_splitter.addWidget(self.extension_container)
         self.work_area_splitter.setChildrenCollapsible(False)
         self.work_area_splitter.setStretchFactor(0, 3)
-        self.work_area_splitter.setStretchFactor(1, 2)
+        self.work_area_splitter.setStretchFactor(1, 3)
+        self.work_area_splitter.setStretchFactor(2, 2)
         self.view_log_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         self.view_log_splitter.addWidget(self.work_area_splitter)
         self.view_log_splitter.addWidget(self.terminal)
@@ -2344,34 +2355,48 @@ class MurBaseGui(QtWidgets.QMainWindow):
         state = self._sections.get(title)
         if state is not None:
             return state
-        box = QtWidgets.QGroupBox(title)
-        layout = QtWidgets.QGridLayout(box)
+        tab = QtWidgets.QWidget()
+        outer = QtWidgets.QVBoxLayout(tab)
+        button_container = QtWidgets.QWidget()
+        button_container.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed
+        )
+        layout = QtWidgets.QGridLayout(button_container)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setHorizontalSpacing(6)
         layout.setVerticalSpacing(6)
-        index = len(self._sections)
-        self.section_layout.addWidget(
-            box, index // self._section_columns, index % self._section_columns
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 1)
+        outer.addWidget(button_container)
+        outer.addStretch(1)
+        tab_group = (
+            self.section_container if title in ("General", "MiR", "UR")
+            else self.module_tabs
         )
-        self.section_layout.setColumnStretch(index % self._section_columns, 1)
-        state = {"box": box, "layout": layout, "count": 0}
+        tab_group.addTab(tab, title)
+        if tab_group is self.module_tabs:
+            tab_group.show()
+        state = {"box": tab, "layout": layout, "count": 0}
         self._sections[title] = state
         return state
 
-    def _set_section_columns(self, columns):
-        if columns == self._section_columns:
-            return
-        self._section_columns = columns
-        for index, state in enumerate(self._sections.values()):
-            box = state["box"]
-            self.section_layout.removeWidget(box)
-            self.section_layout.addWidget(box, index // columns, index % columns)
-        for column in range(4):
-            self.section_layout.setColumnStretch(column, 1 if column < columns else 0)
+    def _resize_work_area(self):
+        visible = [
+            (self.section_container, 3),
+            (self.module_tabs, 3),
+            (self.extension_container, 2),
+        ]
+        weights = [weight if not widget.isHidden() else 0 for widget, weight in visible]
+        if sum(weights):
+            self.work_area_splitter.setSizes([weight * 200 for weight in weights])
 
     def _add_button_to_section(self, button, section):
         state = self._section_state(section)
         count = state["count"]
+        button.setMinimumHeight(36)
+        button.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred
+        )
         state["layout"].addWidget(button, count // 2, count % 2)
         state["count"] = count + 1
         return button
@@ -3292,6 +3317,12 @@ class MurBaseGui(QtWidgets.QMainWindow):
             ])
         if self.opt_integrated.isChecked():
             args.extend([
+                "use_integrated_cartesian_admittance_controller:=true",
+                "integrated_controller_initial_active:=false",
+                "activate_joint_controller:=false",
+                f"integrated_controller_use_ft_sensor:={'true' if self.opt_ft.isChecked() else 'false'}",
+                f"integrated_controller_require_wrench:={'true' if self.opt_require_wrench.isChecked() else 'false'}",
+                "launch_integrated_cartesian_move_action:=true",
                 "launch_arm_velocity_safety:=false",
                 "launch_jparse_idk:=false",
             ])
@@ -3304,7 +3335,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
                 f"export MUR_CHECK_UR_NETWORK={'true' if self.selected_sides() else 'false'};",
                 f"export MUR_UR_HOSTS={shlex.quote(' '.join(['UR10_l' if side == 'l' else 'UR10_r' for side in self.selected_sides()]))};",
                 f"export MUR_EXPECTED_REVERSE_IP={shlex.quote(expected_reverse_ip)};",
-                f"export INTEGRATED_CARTESIAN_ACTIVE={'true' if self.opt_integrated.isChecked() else 'false'};",
+                "export INTEGRATED_CARTESIAN_ACTIVE=false;",
                 f"export INTEGRATED_CARTESIAN_USE_FT={'true' if self.opt_ft.isChecked() else 'false'};",
                 f"export INTEGRATED_CARTESIAN_REQUIRE_WRENCH={'true' if self.opt_require_wrench.isChecked() else 'false'};",
                 f"export MOVEIT_WITH_INTEGRATED_CARTESIAN={'true' if self.opt_moveit.isChecked() and self.opt_integrated.isChecked() else 'false'};",
@@ -3437,6 +3468,53 @@ class MurBaseGui(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(250, poll)
 
         poll()
+
+    def enable_cartesian_motion(self, pairs, on_success=None):
+        """Activate only for an explicit motion request, after UR readiness checks."""
+        pairs = list(pairs)
+        if not pairs:
+            return
+        if any(not self.ur_reverse_ready.get(pair, False) for pair in pairs):
+            self.append_log("[gui] Cartesian activation refused: UR reverse missing")
+            return
+        generations = {pair: self._arm_motion_generation.get(pair, 0) for pair in pairs}
+        remaining = set(pairs)
+        failed = {"value": False}
+
+        def done(pair, code, _status):
+            remaining.discard(pair)
+            current = all(self._arm_motion_generation.get(p, 0) == g for p, g in generations.items())
+            if code != 0 or not current:
+                failed["value"] = True
+            if not remaining:
+                if failed["value"]:
+                    self.disable_cartesian_motion(pairs)
+                    self.append_log("[gui] Cartesian activation failed or canceled; motion not started")
+                elif on_success is not None:
+                    on_success()
+
+        for robot, side in pairs:
+            command = (
+                "ros2 run match_mur_gui set_cartesian_controller.py "
+                f"--arm-namespace /{robot}/{SIDES[side]}"
+            )
+            self.start_process(
+                self.process_key(robot, f"enable_cartesian_{side}"),
+                self.remote_ros_command(robot, command),
+                on_finished=partial(done, (robot, side)),
+            )
+
+    def disable_cartesian_motion(self, pairs):
+        for robot, side in pairs:
+            self._next_arm_motion_generation(robot, side)
+            command = (
+                "ros2 run match_mur_gui set_cartesian_controller.py "
+                f"--arm-namespace /{robot}/{SIDES[side]} --disable"
+            )
+            self.start_process(
+                self.process_key(robot, f"disable_cartesian_{side}"),
+                self.remote_ros_command(robot, command),
+            )
 
     def _show_manipulator_jog(self, side):
         dialog = ManipulatorJogDialog(self, side, self)
@@ -3632,11 +3710,21 @@ class MurBaseGui(QtWidgets.QMainWindow):
         max_angular_velocity,
         generation,
         on_finished=None,
+        controller_enabled=False,
     ):
         if not self._arm_motion_generation_is_current(robot, side, generation):
             self.append_log(f"[gui] Alignment {robot}/{SIDES[side]} canceled before start")
             if on_finished is not None:
                 on_finished(130, QtCore.QProcess.CrashExit)
+            return
+        if not controller_enabled:
+            self.enable_cartesian_motion(
+                [(robot, side)],
+                on_success=lambda: self._start_plane_alignment(
+                    robot, side, alignment_key, max_angular_velocity, generation,
+                    on_finished, controller_enabled=True,
+                ),
+            )
             return
         max_angular_velocity = max(0.03, min(0.30, max_angular_velocity))
         alignment_timeout = max(
@@ -3665,6 +3753,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
         for robot in robots:
             for side in SIDES:
                 self._next_arm_motion_generation(robot, side)
+        self.disable_cartesian_motion([(robot, side) for robot in robots for side in SIDES])
         self.append_log(
             "[gui] STOP ARM MOTION: canceling motion profiles and stopping both arms for "
             + ", ".join(robots)
