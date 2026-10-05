@@ -10,6 +10,7 @@ install(PROGRAMS
   scripts/align_arm_to_plane.py
   scripts/set_cartesian_controller.py
   scripts/ensure_ur_ready.py
+  scripts/shutdown_urs.py
   scripts/general_mur_gui.py
   scripts/move_arm_to_named_pose.py
   scripts/ur_dashboard_safety_check.py
@@ -24,6 +25,7 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_desktop_installer test/test_desktop_installer.py)
   ament_add_pytest_test(test_app_icon test/test_app_icon.py)
   ament_add_pytest_test(test_gui_layout test/test_gui_layout.py)
+  ament_add_pytest_test(test_ur_shutdown test/test_ur_shutdown.py)
 endif()
 
 ament_package()

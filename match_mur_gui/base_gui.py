@@ -56,6 +56,9 @@ REMOTE_HOST_DIAG_REL = os.path.join(
 REMOTE_UR_DASHBOARD_SAFETY_CHECK_REL = os.path.join(
     "src", "match_mur_gui", "scripts", "ur_dashboard_safety_check.py"
 )
+REMOTE_UR_SHUTDOWN_REL = os.path.join(
+    "src", "match_mur_gui", "scripts", "shutdown_urs.py"
+)
 ROBOTS = ["mur620a", "mur620b", "mur620c", "mur620d"]
 SIDES = {"r": "UR10_r", "l": "UR10_l"}
 FREEDRIVE_CONTROLLER = "freedrive_mode_controller"
@@ -243,6 +246,7 @@ class RosWorker(QtCore.QThread):
         self._ready = threading.Event()
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        self._shutdown_arms = set()
 
     def run(self):
         rclpy.init(args=None)
@@ -727,8 +731,9 @@ class RosWorker(QtCore.QThread):
 
         subscription_count = publisher.get_subscription_count()
         msg = Bool()
-        msg.data = bool(enabled)
-        publisher.publish(msg)
+        with self._lock:
+            msg.data = bool(enabled) and (robot_name, side) not in self._shutdown_arms
+            publisher.publish(msg)
 
         if subscription_count == 0:
             return (
@@ -744,8 +749,18 @@ class RosWorker(QtCore.QThread):
     def _set_freedrive_keepalive(self, robot_name, side, enabled):
         key = (robot_name, side)
         with self._lock:
-            self._freedrive_keepalive[key] = bool(enabled)
+            self._freedrive_keepalive[key] = bool(enabled) and key not in self._shutdown_arms
             self._freedrive_keepalive_last[key] = 0.0
+
+    def inhibit_arm_motion(self, pairs, inhibit=True):
+        """Latch shutdown without restoring any previous motion controller."""
+        with self._lock:
+            for pair in pairs:
+                if inhibit:
+                    self._shutdown_arms.add(pair)
+                    self._freedrive_keepalive[pair] = False
+                else:
+                    self._shutdown_arms.discard(pair)
 
     def _publish_freedrive_keepalives(self):
         period = 1.0 / FREEDRIVE_KEEPALIVE_HZ
@@ -762,8 +777,10 @@ class RosWorker(QtCore.QThread):
             _topic, publisher = self._get_freedrive_enable_publisher(robot_name, side)
             msg = Bool()
             msg.data = True
-            publisher.publish(msg)
-            self._freedrive_keepalive_last[(robot_name, side)] = now
+            with self._lock:
+                if (robot_name, side) not in self._shutdown_arms:
+                    publisher.publish(msg)
+                    self._freedrive_keepalive_last[(robot_name, side)] = now
 
     def _stop_all_freedrive_keepalives(self):
         with self._lock:
@@ -792,7 +809,13 @@ class RosWorker(QtCore.QThread):
         request.activate_asap = True
         request.timeout = self._duration_msg(5.0)
         self.log.emit(f"[ros] {label}: activate={activate}, deactivate={deactivate}")
-        future = client.call_async(request)
+        with self._lock:
+            if activate and any(
+                self._controller_manager(*pair) == controller_manager
+                for pair in self._shutdown_arms
+            ):
+                return False, f"{label}: activation refused during UR shutdown"
+            future = client.call_async(request)
         if not self._wait_for_future(future, 6.0):
             return False, f"{label}: timeout while switching controllers"
         response = future.result()
@@ -802,6 +825,9 @@ class RosWorker(QtCore.QThread):
         return True, f"{label}: switch ok"
 
     def switch_freedrive(self, robot_name, side, enable, fallback_controller):
+        with self._lock:
+            if (robot_name, side) in self._shutdown_arms:
+                return
         thread = threading.Thread(
             target=self._switch_freedrive_worker,
             args=(robot_name, side, enable, fallback_controller),
@@ -918,7 +944,10 @@ class RosWorker(QtCore.QThread):
         msg.twist.angular.x = float(values[3])
         msg.twist.angular.y = float(values[4])
         msg.twist.angular.z = float(values[5])
-        publisher.publish(msg)
+        with self._lock:
+            if (robot_name, side) in self._shutdown_arms:
+                msg.twist = Twist()
+            publisher.publish(msg)
         if publisher.get_subscription_count() == 0 and any(abs(float(v)) > 1e-6 for v in values):
             now = time.monotonic()
             last_warn = self._arm_twist_last_warn.get(topic, 0.0)
@@ -2031,6 +2060,9 @@ class MurGuiContext:
     def add_tool_button(self, text, callback, section="Tools"):
         return self.window.add_tool_button(text, callback, section=section)
 
+    def add_section_widget(self, widget, section="Tools"):
+        return self.window.add_section_widget(widget, section=section)
+
     def add_bottom_widget(self, widget):
         self.window.bottom_layout.addWidget(widget)
         return widget
@@ -2070,6 +2102,10 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.resize(1300, 780)
         self.processes = {}
         self._arm_motion_generation = {}
+        self._ur_shutdown_pairs = set()
+        self._ur_shutdown_pending = set()
+        self._ur_shutdown_generation = 0
+        self._ur_starting_pairs = set()
         self.arm_status = {}
         self.arm_feedback = {}
         self.ur_reverse_ready = {}
@@ -2150,6 +2186,16 @@ class MurBaseGui(QtWidgets.QMainWindow):
             "border: 1px solid #9b2c2c; padding: 7px 10px; }"
             "QPushButton:hover { background: #b52a2a; }"
             "QPushButton:pressed { background: #822727; }"
+        )
+        self.shutdown_urs_button = self.add_action_button(
+            "Ausgewählte URs herunterfahren", self.shutdown_selected_urs, section="UR"
+        )
+        self.shutdown_urs_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_TitleBarCloseButton)
+        )
+        self.shutdown_urs_button.setToolTip(
+            "Markierte MuRs und UR-Armseiten: Programm stoppen, Arm ausschalten, "
+            "Control Box herunterfahren"
         )
 
         self.terminal = QtWidgets.QPlainTextEdit()
@@ -2355,8 +2401,13 @@ class MurBaseGui(QtWidgets.QMainWindow):
         state = self._sections.get(title)
         if state is not None:
             return state
-        tab = QtWidgets.QWidget()
-        outer = QtWidgets.QVBoxLayout(tab)
+        tab = QtWidgets.QScrollArea()
+        tab.setWidgetResizable(True)
+        tab.setFrameShape(QtWidgets.QFrame.NoFrame)
+        tab.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        content = QtWidgets.QWidget()
+        outer = QtWidgets.QVBoxLayout(content)
+        outer.setContentsMargins(6, 6, 6, 6)
         button_container = QtWidgets.QWidget()
         button_container.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed
@@ -2369,6 +2420,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
         layout.setColumnStretch(1, 1)
         outer.addWidget(button_container)
         outer.addStretch(1)
+        tab.setWidget(content)
         tab_group = (
             self.section_container if title in ("General", "MiR", "UR")
             else self.module_tabs
@@ -2406,6 +2458,13 @@ class MurBaseGui(QtWidgets.QMainWindow):
 
     def add_tool_button(self, text, callback, section="Tools"):
         return self.add_action_button(text, callback, section=section)
+
+    def add_section_widget(self, widget, section="Tools"):
+        state = self._section_state(section)
+        row = (state["count"] + 1) // 2
+        state["layout"].addWidget(widget, row, 0, 1, 2)
+        state["count"] = (row + 1) * 2
+        return widget
 
     def update_moveit_speed_label(self, value):
         self.moveit_speed_label.setText(f"MoveIt speed: {value}%")
@@ -2473,6 +2532,130 @@ class MurBaseGui(QtWidgets.QMainWindow):
     def remote_ur_dashboard_safety_check_script(self):
         return os.path.join(self.remote_ws(), REMOTE_UR_DASHBOARD_SAFETY_CHECK_REL)
 
+    def _ur_shutdown_command(self, robot, sides):
+        script = os.path.join(self.remote_ws(), REMOTE_UR_SHUTDOWN_REL)
+        args = ["timeout", "--signal=TERM", "--kill-after=3s", "100s",
+                "python3", "-u", script, "--json"]
+        for side in sides:
+            args.extend(["--host", SIDES[side]])
+        remote_shell = "bash -lc " + shlex.quote(shlex.join(args))
+        return (
+            "ssh -o BatchMode=yes -o ConnectTimeout=5 "
+            "-o ServerAliveInterval=5 -o ServerAliveCountMax=3 "
+            f"{shlex.quote(robot)} {shlex.quote(remote_shell)}"
+        )
+
+    def _ur_shutdown_conflicts(self, robots, sides):
+        if any((robot, side) in self._ur_starting_pairs for robot in robots for side in sides):
+            self.append_log(
+                "[gui] UR shutdown refused: hardware startup is still enabling URs. "
+                "Wait for UR readiness or stop managed hardware processes first."
+            )
+            return True
+        # Let explicit enable/preflight operations finish before issuing shutdown.
+        for robot in robots:
+            for action in ("ensure_ur_ready", "hardware_preflight",
+                           "ur_safety_preflight", "ur_safety_clear"):
+                process = self.processes.get(self.process_key(robot, action))
+                if process is not None and process.state() != QtCore.QProcess.NotRunning:
+                    self.append_log(f"[gui] UR shutdown refused: wait for {robot}:{action}")
+                    return True
+        return False
+
+    def shutdown_selected_urs(self):
+        robots = self.checked_robots()
+        sides = self.selected_sides()
+        if not robots or not sides:
+            self.append_log("[gui] UR shutdown refused: select at least one MuR and UR arm")
+            return
+        if self._ur_shutdown_pending:
+            self.append_log("[gui] UR shutdown already in progress")
+            return
+        if self._ur_shutdown_conflicts(robots, sides):
+            return
+        targets = "\n".join(f"• {robot}/{SIDES[side]}" for robot in robots for side in sides)
+        answer = QtWidgets.QMessageBox.question(
+            self, "URs kontrolliert herunterfahren",
+            "Diese URs einschließlich ihrer Control Box herunterfahren?\n\n"
+            + targets + "\n\nProgramm stoppen → Arm ausschalten → Control Box herunterfahren."
+            "\nWerkstücke vorher ablegen oder sichern. Es wird keine Parkpose angefahren."
+            "\nMiR, Hubachsen und MuR-Rechner bleiben eingeschaltet."
+            "\nZum erneuten Einschalten ist eine lokale Bedienung erforderlich.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+            QtWidgets.QMessageBox.Cancel,
+        )
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+        # The modal dialog runs a Qt event loop; preflights/retries may have started.
+        if self._ur_shutdown_conflicts(robots, sides):
+            return
+        pairs = [(robot, side) for robot in robots for side in sides]
+        self._ur_shutdown_generation += 1
+        self._ur_shutdown_pairs.update(pairs)
+        self._ur_shutdown_pending.update(robots)
+        self.shutdown_urs_button.setEnabled(False)
+        self.ros_worker.inhibit_arm_motion(pairs)
+        for robot, side in pairs:
+            self._next_arm_motion_generation(robot, side)
+            self.set_ur_reverse_ready(robot, side, False, "shutdown requested")
+            self.freedrive_active[(robot, side)] = False
+            self.set_arm_feedback(robot, side, "UR wird heruntergefahren")
+        self.update_freedrive_button()
+        self._prepare_arm_motion_profile(robots, sides)
+        self.disable_cartesian_motion(pairs)
+        for robot in robots:
+            self._start_ur_shutdown(robot, tuple(sides))
+
+    def _start_ur_shutdown(self, robot, sides):
+        completed = {"value": False}
+
+        def done(code, status, output):
+            if completed["value"]:
+                return
+            completed["value"] = True
+            watchdog.stop()
+            watchdog.deleteLater()
+            try:
+                payload = self._parse_ur_safety_payload(output)
+                if not isinstance(payload, dict) or not isinstance(payload.get("arms"), list):
+                    raise ValueError("Invalid shutdown result")
+                if any(not isinstance(arm, dict) for arm in payload["arms"]):
+                    raise ValueError("Invalid arm result")
+                arms = {arm["host"]: arm for arm in payload["arms"]}
+            except (ValueError, KeyError, TypeError):
+                arms = {}
+            for side in sides:
+                arm = arms.get(SIDES[side], {})
+                if arm.get("shutdown_accepted") is True and status == QtCore.QProcess.NormalExit:
+                    self.set_arm_feedback(robot, side, "Herunterfahren vom UR bestätigt")
+                else:
+                    error = arm.get("error") or f"Keine Abschaltbestätigung (Code {code}); UR prüfen"
+                    self.set_arm_feedback(robot, side, f"UR-Abschalten fehlgeschlagen: {error}", True)
+            self._ur_shutdown_pending.discard(robot)
+            self.shutdown_urs_button.setEnabled(not self._ur_shutdown_pending)
+            if not self._ur_shutdown_pending:
+                self.append_log(
+                    "[gui] UR shutdown finished. Check each arm's result. "
+                    "Motion stays blocked until explicit Enable URs / Ready or Start Hardware."
+                )
+
+        name = self.process_key(robot, "ur_shutdown")
+        watchdog = QtCore.QTimer(self)
+        watchdog.setSingleShot(True)
+        self.start_captured_process(name, self._ur_shutdown_command(robot, sides), done)
+        process = self.processes[name]
+
+        def timed_out():
+            process.kill()
+            done(124, QtCore.QProcess.CrashExit, "")
+
+        watchdog.timeout.connect(timed_out)
+        process.errorOccurred.connect(
+            lambda error: done(-1, QtCore.QProcess.CrashExit, "")
+            if error == QtCore.QProcess.FailedToStart else None
+        )
+        watchdog.start(125000)
+
     def selected_sides(self):
         sides = []
         if self.arm_r.isChecked():
@@ -2524,6 +2707,10 @@ class MurBaseGui(QtWidgets.QMainWindow):
 
     def set_ur_reverse_ready(self, robot, side, ready, reason):
         key = (robot, side)
+        if key in self._ur_shutdown_pairs:
+            ready = False
+        if ready:
+            self._ur_starting_pairs.discard(key)
         if self.ur_reverse_ready.get(key) == ready:
             return
         self.ur_reverse_ready[key] = ready
@@ -2560,6 +2747,8 @@ class MurBaseGui(QtWidgets.QMainWindow):
                 self.refresh_status_label(robot, side)
 
     def update_freedrive_status(self, robot, side, active, message):
+        if (robot, side) in self._ur_shutdown_pairs:
+            active = False
         self.freedrive_active[(robot, side)] = active
         self.append_log(
             f"[gui] {robot}/{SIDES[side]} freedrive={'ON' if active else 'OFF'}: {message}"
@@ -2964,6 +3153,12 @@ class MurBaseGui(QtWidgets.QMainWindow):
             )
 
     def start_hardware(self):
+        if self._ur_shutdown_pending:
+            self.append_log("[gui] Hardware start refused: UR shutdown in progress")
+            return
+        pairs = self.robot_arm_pairs()
+        self._ur_shutdown_pairs.difference_update(pairs)
+        self.ros_worker.inhibit_arm_motion(pairs, False)
         for module in self.modules:
             module.on_hardware_start()
         for robot in self.selected_robots():
@@ -3292,6 +3487,14 @@ class MurBaseGui(QtWidgets.QMainWindow):
         )
 
     def _launch_hardware_for_robot(self, robot):
+        if any((robot, side) in getattr(self, "_ur_shutdown_pairs", set())
+               for side in self.selected_sides()):
+            self.append_log(f"[gui] Hardware start refused for {robot}: UR shutdown latch")
+            return
+        running = getattr(self, "processes", {}).get(self.process_key(robot, "hardware"))
+        if running is not None and running.state() != QtCore.QProcess.NotRunning:
+            self.append_log(f"[gui] {robot}: hardware already running")
+            return
         expected_reverse_ip = "192.168.12.69" if robot == "mur620d" else ""
         args = [
             f"robot_name:={robot}",
@@ -3347,7 +3550,12 @@ class MurBaseGui(QtWidgets.QMainWindow):
             + [shlex.quote(arg) for arg in args]
         )
         command = self.remote_command(robot, env_prefix + " " + launch_cmd)
-        self.start_process(self.process_key(robot, "hardware"), command)
+        startup_pairs = {(robot, side) for side in self.selected_sides()}
+        self._ur_starting_pairs.update(startup_pairs)
+        self.start_process(
+            self.process_key(robot, "hardware"), command,
+            on_finished=lambda _code, _status: self._ur_starting_pairs.difference_update(startup_pairs),
+        )
 
     def ensure_ur_ready(self, sides=None, robots=None, on_success=None, retry_count=0):
         if isinstance(sides, bool):
@@ -3356,6 +3564,9 @@ class MurBaseGui(QtWidgets.QMainWindow):
             robots = None
         selected_robots = list(robots or self.selected_robots())
         selected = list(sides) if sides is not None else self.selected_sides()
+        if self._ur_shutdown_pending:
+            self.append_log("[gui] UR enable refused: shutdown in progress")
+            return False
         if not selected:
             self.append_log("[gui] Refusing UR ready check: no arm selected")
             return False
@@ -3363,6 +3574,9 @@ class MurBaseGui(QtWidgets.QMainWindow):
             self.append_log("[gui] Refusing UR ready check: no robot selected")
             return False
         if retry_count == 0:
+            pairs = [(robot, side) for robot in selected_robots for side in selected]
+            self._ur_shutdown_pairs.difference_update(pairs)
+            self.ros_worker.inhibit_arm_motion(pairs, False)
             for robot in selected_robots:
                 self.ur_ready_log_scan_start[robot] = None
                 for side in selected:
@@ -3370,7 +3584,11 @@ class MurBaseGui(QtWidgets.QMainWindow):
                         robot, side, False, "manual enable/check requested"
                     )
 
+        shutdown_generation = self._ur_shutdown_generation
+
         def retry(reason):
+            if shutdown_generation != self._ur_shutdown_generation:
+                return
             if retry_count >= UR_READY_RETRY_LIMIT:
                 self.append_log(
                     "[gui] UR ready check failed after retry. Not arming motion. "
@@ -3388,7 +3606,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
                     robots=selected_robots,
                     on_success=on_success,
                     retry_count=retry_count + 1,
-                ),
+                ) if shutdown_generation == self._ur_shutdown_generation else None,
             )
 
         self.append_log(
@@ -3398,9 +3616,14 @@ class MurBaseGui(QtWidgets.QMainWindow):
         remaining = set(selected_robots)
 
         def robot_ready(robot):
+            if shutdown_generation != self._ur_shutdown_generation:
+                return
             remaining.discard(robot)
             if not remaining and on_success is not None:
-                QtCore.QTimer.singleShot(200, on_success)
+                QtCore.QTimer.singleShot(
+                    200, lambda: on_success()
+                    if shutdown_generation == self._ur_shutdown_generation else None
+                )
 
         for robot in selected_robots:
             commands = []
@@ -3417,6 +3640,8 @@ class MurBaseGui(QtWidgets.QMainWindow):
             command = self.remote_ros_command(robot, " && ".join(commands))
 
             def done(exit_code, _status, current_robot=robot):
+                if shutdown_generation != self._ur_shutdown_generation:
+                    return
                 if exit_code == 0:
                     self._wait_for_ur_reverse_ready(
                         current_robot,
@@ -3436,8 +3661,11 @@ class MurBaseGui(QtWidgets.QMainWindow):
     def _wait_for_ur_reverse_ready(self, robot, sides, on_success=None, on_timeout=None):
         deadline = time.monotonic() + UR_REVERSE_WAIT_SEC
         stable_since = {"time": None}
+        shutdown_generation = self._ur_shutdown_generation
 
         def poll():
+            if shutdown_generation != self._ur_shutdown_generation:
+                return
             missing = [
                 side for side in sides
                 if not self.ur_reverse_ready.get((robot, side), False)
@@ -3452,7 +3680,10 @@ class MurBaseGui(QtWidgets.QMainWindow):
                         + ", ".join(SIDES[side] for side in sides)
                     )
                     if on_success is not None:
-                        QtCore.QTimer.singleShot(200, on_success)
+                        QtCore.QTimer.singleShot(
+                            200, lambda: on_success()
+                            if shutdown_generation == self._ur_shutdown_generation else None
+                        )
                     return
                 QtCore.QTimer.singleShot(250, poll)
                 return
@@ -3473,6 +3704,9 @@ class MurBaseGui(QtWidgets.QMainWindow):
         """Activate only for an explicit motion request, after UR readiness checks."""
         pairs = list(pairs)
         if not pairs:
+            return
+        if any(pair in self._ur_shutdown_pairs for pair in pairs):
+            self.append_log("[gui] Cartesian activation refused: UR shutdown latch")
             return
         if any(not self.ur_reverse_ready.get(pair, False) for pair in pairs):
             self.append_log("[gui] Cartesian activation refused: UR reverse missing")
@@ -3525,6 +3759,9 @@ class MurBaseGui(QtWidgets.QMainWindow):
 
     def open_manipulator_jog(self, side):
         robots = self.selected_robots()
+        if any((robot, side) in self._ur_shutdown_pairs for robot in robots):
+            self.append_log("[gui] Jog refused: UR shutdown latch; explicitly enable UR first")
+            return
         missing_robots = [
             robot for robot in robots
             if not self.ur_reverse_ready.get((robot, side), False)
@@ -3783,6 +4020,9 @@ class MurBaseGui(QtWidgets.QMainWindow):
 
     def toggle_freedrive(self):
         pairs = self.robot_arm_pairs()
+        if any(pair in self._ur_shutdown_pairs for pair in pairs):
+            self.append_log("[gui] Freedrive refused: UR shutdown latch")
+            return
         if not pairs:
             self.append_log("[gui] Refusing freedrive: no arm selected")
             return
@@ -3824,6 +4064,9 @@ class MurBaseGui(QtWidgets.QMainWindow):
     def move_home(self, side):
         prefix = SIDES[side]
         robots = list(self.selected_robots())
+        if any((robot, side) in self._ur_shutdown_pairs for robot in robots):
+            self.append_log("[gui] Home refused: UR shutdown latch; explicitly enable UR first")
+            return
         generations = {}
         for robot in robots:
             self.set_arm_feedback(robot, side, "Home: prüfe UR-Sicherheit")
@@ -3962,6 +4205,8 @@ class MurBaseGui(QtWidgets.QMainWindow):
                 self.remote_command(robot, cleanup_cmd),
             )
         for name, process in list(self.processes.items()):
+            if name.endswith(":ur_shutdown") and self._ur_shutdown_pending:
+                continue
             if name == "object_cleanup" or name.endswith(":remote_cleanup"):
                 continue
             if process.state() == QtCore.QProcess.NotRunning:
@@ -3972,6 +4217,10 @@ class MurBaseGui(QtWidgets.QMainWindow):
                 process.kill()
 
     def closeEvent(self, event):
+        if self._ur_shutdown_pending:
+            self.append_log("[gui] Close deferred: please wait for UR shutdown results")
+            event.ignore()
+            return
         self.stop_managed_processes()
         for module in self.modules:
             module.on_shutdown()

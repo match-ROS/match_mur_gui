@@ -66,7 +66,8 @@ def test_gui_hardware_start_does_not_activate_motion():
         remote_hardware_script=lambda: '/repo/start_mur620_hardware_logged.sh',
         remote_command=lambda robot, command: command,
         process_key=lambda robot, name: name,
-        start_process=lambda name, command: commands.append(command),
+        start_process=lambda name, command, **kwargs: commands.append(command),
+        _ur_starting_pairs=set(),
     )
     MurBaseGui._launch_hardware_for_robot(window, 'mur620a')
     command = commands[0]
