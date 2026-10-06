@@ -1,10 +1,12 @@
 """The shared GUI keeps base actions, module actions and views separate."""
 
 import os
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5 import QtWidgets
+from sensor_msgs.msg import BatteryState
 
 from match_mur_gui import base_gui
 
@@ -19,6 +21,7 @@ class _RosWorker:
         self.log = _Signal()
         self.freedrive_status = _Signal()
         self.battery_status = _Signal()
+        self.battery_details = _Signal()
 
     def start(self):
         pass
@@ -99,3 +102,28 @@ def test_base_gui_has_only_base_tabs(monkeypatch, tmp_path):
     assert not window.module_tabs.isVisible()
     assert not window.extension_container.isVisible()
     window.close()
+
+
+def test_battery_badge_shows_charging_details_and_stale_data():
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    badge = base_gui.BatteryBadge('MuR', 'mur620d')
+    badge.set_value(30.3)
+    badge.set_details({
+        'status': BatteryState.POWER_SUPPLY_STATUS_CHARGING,
+        'voltage': 56.3,
+        'current': 16.6,
+        'charge': 13.816,
+        'capacity': None,
+    })
+    text = '\n'.join(badge.detail_lines())
+    assert 'Lädt' in text
+    assert '16.60 A' in text
+    assert '935 W' in text
+    assert 'Bis voll bei aktuellem Strom' in text
+    badge.value_at = time.monotonic() - badge.STALE_AFTER_SEC - 1
+    for key in badge.detail_times:
+        badge.detail_times[key] = badge.value_at
+    text = '\n'.join(badge.detail_lines())
+    assert 'keine aktuellen Daten' in text
+    assert '16.60 A' not in text
+    badge.close()

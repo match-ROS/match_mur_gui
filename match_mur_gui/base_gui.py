@@ -24,7 +24,7 @@ from geometry_msgs.msg import Pose, PoseStamped, Twist, TwistStamped
 from lifecycle_msgs.msg import State, TransitionEvent
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from sensor_msgs.msg import BatteryState
-from std_msgs.msg import Bool, Float32
+from std_msgs.msg import Bool, Float32, Int32
 from std_srvs.srv import SetBool, Trigger
 from ewellix_interfaces.msg import Command as EwellixCommand, State as EwellixState
 from mir_srvs.srv import ColorRGB
@@ -161,38 +161,133 @@ def quaternion_to_yaw(orientation):
 
 
 class BatteryBadge(QtWidgets.QWidget):
-    def __init__(self, label, parent=None):
+    STALE_AFTER_SEC = 10.0
+
+    def __init__(self, label, robot='', parent=None):
         super().__init__(parent)
         self.label = label
+        self.robot = robot
         self.value = None
+        self.value_at = 0.0
+        self.details = {}
+        self.detail_times = {}
         self.setFixedSize(78, 24)
-        self.setToolTip(f"{label} battery: no data")
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+        self._stale_timer = QtCore.QTimer(self)
+        self._stale_timer.timeout.connect(self._refresh)
+        self._stale_timer.start(2000)
+        self._refresh()
 
     def set_value(self, value):
         if value is None or not math.isfinite(value):
             self.value = None
-            self.setToolTip(f"{self.label} battery: no data")
+            self.value_at = 0.0
+            self.details.clear()
+            self.detail_times.clear()
         else:
             self.value = max(0.0, min(100.0, float(value)))
-            self.setToolTip(f"{self.label} battery: {self.value:.0f}%")
+            self.value_at = time.monotonic()
+        self._refresh()
+
+    def set_details(self, details):
+        now = time.monotonic()
+        for key, value in details.items():
+            self.details[key] = value
+            self.detail_times[key] = now
+        self._refresh()
+
+    def _current_value(self):
+        if self.value is None or time.monotonic() - self.value_at > self.STALE_AFTER_SEC:
+            return None
+        return self.value
+
+    def _detail(self, key):
+        if time.monotonic() - self.detail_times.get(key, 0.0) > self.STALE_AFTER_SEC:
+            return None
+        return self.details.get(key)
+
+    @staticmethod
+    def _duration(seconds):
+        minutes = max(0, int(seconds)) // 60
+        hours, minutes = divmod(minutes, 60)
+        return f'{hours} h {minutes:02d} min'
+
+    def detail_lines(self):
+        name = f'{self.robot} · {self.label}' if self.robot else self.label
+        value = self._current_value()
+        lines = [f'{name}-Batterie',
+                 f'Ladezustand: {value:.1f} %' if value is not None else 'Ladezustand: keine aktuellen Daten']
+        status = self._detail('status')
+        states = {
+            BatteryState.POWER_SUPPLY_STATUS_CHARGING: 'Lädt',
+            BatteryState.POWER_SUPPLY_STATUS_DISCHARGING: 'Entlädt',
+            BatteryState.POWER_SUPPLY_STATUS_NOT_CHARGING: 'Lädt nicht',
+            BatteryState.POWER_SUPPLY_STATUS_FULL: 'Voll',
+        }
+        lines.append('Batteriestatus: ' + states.get(status, 'unbekannt'))
+        voltage = self._detail('voltage')
+        current = self._detail('current')
+        if voltage is not None:
+            lines.append(f'Spannung: {voltage:.1f} V')
+        if current is not None:
+            direction = 'Laden' if current > 0.1 else 'Entladen' if current < -0.1 else 'Nahezu kein Strom'
+            lines.append(f'Strom: {abs(current):.2f} A ({direction})')
+            if voltage is not None:
+                lines.append(f'Leistung: {abs(voltage * current):.0f} W ({direction})')
+        charge = self._detail('charge')
+        capacity = self._detail('capacity')
+        if charge is not None:
+            lines.append(f'Restkapazität: {charge:.1f} Ah')
+        if capacity is not None:
+            lines.append(f'Volle Kapazität: {capacity:.1f} Ah')
+        remaining = self._detail('remaining_seconds')
+        if remaining is not None and status != BatteryState.POWER_SUPPLY_STATUS_CHARGING:
+            lines.append(f'Restlaufzeit (MiR): {self._duration(remaining)}')
+        elif status == BatteryState.POWER_SUPPLY_STATUS_DISCHARGING and charge is not None and current is not None and current < -0.2:
+            lines.append(f'Restlaufzeit bei aktueller Last: ca. {self._duration(charge / -current * 3600)}')
+        if status == BatteryState.POWER_SUPPLY_STATUS_CHARGING and current is not None and current > 0.2 and charge is not None:
+            full = capacity
+            if full is None and value is not None and 5.0 <= value < 98.0:
+                full = charge / (value / 100.0)
+            if full is not None and full > charge:
+                lines.append(f'Bis voll bei aktuellem Strom: ca. {self._duration((full - charge) / current * 3600)}')
+        if len(lines) == 3 and value is not None:
+            lines.append('Weitere Messwerte derzeit nicht verfügbar')
+        return lines
+
+    def _refresh(self):
+        self.setToolTip('\n'.join(self.detail_lines()) + '\nKlicken für Details')
         self.update()
 
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            menu = QtWidgets.QMenu(self)
+            for line in self.detail_lines():
+                action = menu.addAction(line)
+                action.setEnabled(False)
+            menu.aboutToHide.connect(menu.deleteLater)
+            menu.popup(self.mapToGlobal(QtCore.QPoint(0, self.height())))
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
     def color(self):
-        if self.value is None:
-            return QtGui.QColor("#a0aec0")
-        if self.value >= 50.0:
-            return QtGui.QColor("#48bb78")
-        if self.value >= 30.0:
-            return QtGui.QColor("#ecc94b")
-        if self.value >= 15.0:
-            return QtGui.QColor("#ed8936")
-        return QtGui.QColor("#e53e3e")
+        value = self._current_value()
+        if value is None:
+            return QtGui.QColor('#a0aec0')
+        if value >= 50.0:
+            return QtGui.QColor('#48bb78')
+        if value >= 30.0:
+            return QtGui.QColor('#ecc94b')
+        if value >= 15.0:
+            return QtGui.QColor('#ed8936')
+        return QtGui.QColor('#e53e3e')
 
     def paintEvent(self, _event):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
 
-        outline = QtGui.QColor("#4a5568")
+        outline = QtGui.QColor('#4a5568')
         body = QtCore.QRectF(1.5, 5.0, 24.0, 14.0)
         terminal = QtCore.QRectF(25.5, 9.0, 3.0, 6.0)
         painter.setPen(QtGui.QPen(outline, 1.2))
@@ -200,15 +295,22 @@ class BatteryBadge(QtWidgets.QWidget):
         painter.drawRoundedRect(body, 2.0, 2.0)
         painter.drawRect(terminal)
 
-        fill_width = 0.0 if self.value is None else (body.width() - 4.0) * self.value / 100.0
+        value = self._current_value()
+        fill_width = 0.0 if value is None else (body.width() - 4.0) * value / 100.0
         if fill_width > 0.0:
             fill = QtCore.QRectF(body.left() + 2.0, body.top() + 2.0, fill_width, body.height() - 4.0)
             painter.setPen(QtCore.Qt.NoPen)
             painter.setBrush(self.color())
-            painter.drawRoundedRect(fill, 1.2, 1.2)
-
-        text = f"{self.label} --%" if self.value is None else f"{self.label} {self.value:.0f}%"
-        painter.setPen(QtGui.QColor("#1a202c"))
+            painter.drawRect(fill)
+        if self._detail('status') == BatteryState.POWER_SUPPLY_STATUS_CHARGING:
+            painter.setPen(QtGui.QPen(QtGui.QColor('#1a202c'), 1.5))
+            bolt = QtGui.QPolygonF([
+                QtCore.QPointF(14, 6), QtCore.QPointF(10, 12),
+                QtCore.QPointF(14, 12), QtCore.QPointF(11, 19),
+            ])
+            painter.drawPolyline(bolt)
+        text = f'{self.label} --%' if value is None else f'{self.label} {value:.0f}%'
+        painter.setPen(QtGui.QColor('#1a202c'))
         font = painter.font()
         font.setPointSize(8)
         font.setBold(True)
@@ -221,6 +323,7 @@ class RosWorker(QtCore.QThread):
     set_bool_result = QtCore.pyqtSignal(str, bool, bool, str)
     freedrive_status = QtCore.pyqtSignal(str, str, bool, str)
     battery_status = QtCore.pyqtSignal(str, str, float, bool)
+    battery_details = QtCore.pyqtSignal(str, str, object)
 
     def __init__(self, robot_names=None):
         super().__init__()
@@ -326,7 +429,39 @@ class RosWorker(QtCore.QThread):
                     partial(self._on_mir_battery, robot_name),
                     10,
                 )
-                self._battery_subs.extend([mur_sub, mir_sub])
+                mur_state_sub = self._node.create_subscription(
+                    BatteryState,
+                    f'/{robot_name}/bms_status/battery_state',
+                    partial(self._on_mur_state, robot_name),
+                    10,
+                )
+                mir_remaining_sub = self._node.create_subscription(
+                    Int32,
+                    f'/{robot_name}/battery_time_remaining',
+                    partial(self._on_mir_remaining, robot_name),
+                    10,
+                )
+                self._battery_subs.extend([mur_sub, mur_state_sub, mir_sub, mir_remaining_sub])
+
+    @staticmethod
+    def _battery_fields(msg):
+        fields = {'status': int(msg.power_supply_status)}
+        for name in ('voltage', 'current', 'charge', 'capacity'):
+            value = float(getattr(msg, name))
+            fields[name] = value if math.isfinite(value) and (name == 'current' or value > 0.0) else None
+        if fields['status'] == BatteryState.POWER_SUPPLY_STATUS_UNKNOWN and fields['current'] == 0.0:
+            fields['current'] = None
+        return fields
+
+    def _on_mur_state(self, robot_name, msg):
+        percentage = float(msg.percentage) * 100.0
+        if math.isfinite(percentage) and 0.0 <= percentage <= 100.0:
+            self.battery_status.emit(robot_name, 'mur', percentage, True)
+        self.battery_details.emit(robot_name, 'mur', self._battery_fields(msg))
+
+    def _on_mir_remaining(self, robot_name, msg):
+        if msg.data >= 0:
+            self.battery_details.emit(robot_name, 'mir', {'remaining_seconds': int(msg.data)})
 
     def _on_mur_battery(self, robot_name, msg):
         self.battery_status.emit(robot_name, "mur", float(msg.data), True)
@@ -335,7 +470,8 @@ class RosWorker(QtCore.QThread):
         percentage = float(msg.percentage)
         if 0.0 <= percentage <= 1.0:
             percentage *= 100.0
-        self.battery_status.emit(robot_name, "mir", percentage, math.isfinite(percentage))
+        self.battery_status.emit(robot_name, 'mir', percentage, math.isfinite(percentage))
+        self.battery_details.emit(robot_name, 'mir', self._battery_fields(msg))
 
     def _on_lift_state(self, robot_name, side, msg):
         positions = [position for position in msg.actual_positions[:2] if position >= 0]
@@ -2127,6 +2263,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.ros_worker.log.connect(self.append_log)
         self.ros_worker.freedrive_status.connect(self.update_freedrive_status)
         self.ros_worker.battery_status.connect(self.update_battery_status)
+        self.ros_worker.battery_details.connect(self.update_battery_details)
         self.ros_worker.start()
 
         central = QtWidgets.QWidget()
@@ -2263,8 +2400,8 @@ class MurBaseGui(QtWidgets.QMainWindow):
             self.robot_checks[robot] = check
             row.addWidget(check)
             row.addStretch(1)
-            mir_badge = BatteryBadge("MiR")
-            mur_badge = BatteryBadge("MuR")
+            mir_badge = BatteryBadge("MiR", robot)
+            mur_badge = BatteryBadge("MuR", robot)
             self.battery_badges[(robot, "mir")] = mir_badge
             self.battery_badges[(robot, "mur")] = mur_badge
             row.addWidget(mir_badge)
@@ -2695,6 +2832,11 @@ class MurBaseGui(QtWidgets.QMainWindow):
         badge = getattr(self, "battery_badges", {}).get(key)
         if badge is not None:
             badge.set_value(percentage if valid else None)
+
+    def update_battery_details(self, robot, source, details):
+        badge = getattr(self, 'battery_badges', {}).get((robot, source))
+        if badge is not None:
+            badge.set_details(details)
 
     def update_arm_status(self, robot, side, status):
         self.arm_status[(robot, side)] = status

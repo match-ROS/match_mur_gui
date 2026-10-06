@@ -8,6 +8,23 @@ source /home/rosmatch/colcon_ws/install/setup.bash
 ros2 run match_mur_gui general_mur_gui.py
 ```
 
+## Batteriedetails
+
+Die MiR- und MuR-Batteriesymbole links oben zeigen den Ladezustand. Hover zeigt
+die Details als Tooltip; ein Klick öffnet sie als Liste. Die MuR-BMS liefert
+den expliziten Lade-/Entladezustand, Spannung, Strom und Restkapazität über
+`/<robot>/bms_status/battery_state`. Die MiR-Batterie nutzt den REST-Status für
+Prozent und Restlaufzeit sowie `/PB/bms_status` für Strom, Spannung, Kapazität
+und Ladeflags. Strom und daraus berechnete Leistung sind positiv beim Laden,
+negativ beim Entladen. Eine MuR-Restlaufzeit bzw. Zeit bis voll ist eine
+Schätzung **bei unveränderter momentaner Stromstärke**; MiR liefert zusätzlich
+seine eigene Restlaufzeit-Schätzung. Nicht vorhandene oder mehr als zehn
+Sekunden alte Werte erscheinen nicht als aktuelle Messung.
+
+Nach dem Aktualisieren von `match_mur_gui`, `mir_launch_hardware` und
+`mur_launch_hardware` die Pakete bauen und die GUI sowie die jeweiligen
+Hardwareprozesse neu starten.
+
 ## Ubuntu-Anwendungssuche und Desktop-Icon
 
 Der Installer legt für die Basis-GUI und auf Wunsch für Mocap, Cooperative Handling und OAK eigene Starteinträge und Icons im Stil der MuR-Diagnose an. Er richtet die Verknüpfungen für den aktuellen Benutzer ohne `sudo` ein. Die benötigten ROS-Pakete müssen zuvor im Workspace gebaut sein.
