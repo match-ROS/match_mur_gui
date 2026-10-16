@@ -10,6 +10,7 @@ from PyQt5 import QtGui, QtWidgets
 
 ICON_NAMES = frozenset({
     'mur-base-gui', 'mur-mocap-gui', 'mur-cooperative-gui', 'mur-oak-gui',
+    'mur-navigation-gui',
 })
 
 

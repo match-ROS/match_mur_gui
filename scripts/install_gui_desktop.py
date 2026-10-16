@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install launchers and matching Ubuntu icons for the four MuR GUIs."""
+"""Install launchers and matching Ubuntu icons for the MuR GUIs."""
 
 from __future__ import annotations
 
@@ -27,6 +27,9 @@ APPS = {
                     'MuR;Kooperation;Handling;ROS;'),
     'oak': ('mur-oak-gui', 'MuR OAK Kamera', 'OAK-Kamera an MuR-Robotern bedienen',
             'oak_camera_calibration', 'oak_camera_gui', 'MuR;OAK;Kamera;ROS;'),
+    'navigation': ('mur-navigation-gui', 'MuR Navigation', 'Kartierung und Navigation mit MuR-Robotern',
+                   'match_mur_navigation', 'navigation_gui',
+                   'MuR;Navigation;Mapping;Kartierung;Karte;SLAM;Mocap;ROS;'),
 }
 
 
@@ -222,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
     source = Path(__file__).resolve().parents[1]
     home = Path.home()
     parser.add_argument('--app', choices=('all', *APPS), default='all',
-                        help='GUI auswählen; Standard: alle vier')
+                        help='GUI auswählen; Standard: alle')
     parser.add_argument('--workspace', type=Path, default=source.parent.parent,
                         help='Colcon-Workspace; Standard: Workspace dieses Repositories')
     parser.add_argument('--ros-setup', type=Path, default=Path('/opt/ros/jazzy/setup.bash'))

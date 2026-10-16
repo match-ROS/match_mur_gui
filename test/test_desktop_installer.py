@@ -1,4 +1,4 @@
-"""User-level desktop entries for the four MuR GUIs."""
+"""User-level desktop entries for the MuR GUIs."""
 
 import importlib.util
 from pathlib import Path
@@ -28,7 +28,7 @@ def _install(tmp_path, monkeypatch, apps=tuple(INSTALLER.APPS), shortcut=True):
     return files, untrusted, desktop
 
 
-def test_four_entries_icons_and_launchers_are_repeatable(tmp_path, monkeypatch):
+def test_all_entries_icons_and_launchers_are_repeatable(tmp_path, monkeypatch):
     files, untrusted, desktop = _install(tmp_path, monkeypatch)
     assert not untrusted
     for app, (slug, title, _comment, package, executable, _keywords) in INSTALLER.APPS.items():
@@ -52,7 +52,7 @@ def test_four_entries_icons_and_launchers_are_repeatable(tmp_path, monkeypatch):
         subprocess.run(['desktop-file-validate', *map(str, desktop.glob('*.desktop'))], check=True)
     again, _, _ = _install(tmp_path, monkeypatch)
     assert files == again
-    assert len(list((tmp_path / 'share/applications').glob('*.desktop'))) == 4
+    assert len(list((tmp_path / 'share/applications').glob('*.desktop'))) == len(INSTALLER.APPS)
 
 
 def test_foreign_launcher_blocks_all_writes(tmp_path, monkeypatch):
