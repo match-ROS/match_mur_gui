@@ -63,8 +63,11 @@ def main():
                     continue
             if args.mode == 'amcl':
                 ns = '/'+args.robot+'/localization'
-                if node.count_publishers(ns+'/amcl_pose') or node.count_publishers(ns+'/comparison'):
+                if node.count_publishers(ns+'/amcl_pose'):
                     node.get_logger().info('Vorhandene AMCL-Sitzung wird verwendet; GUI übernimmt deren Prozesse nicht.')
+                elif node.count_publishers(ns+'/comparison'):
+                    raise RuntimeError('AMCL-Prozess fehlt; ein alter Lokalisierungsadapter läuft noch. '
+                                       'Die alte Lokalisierung auf ihrem Rechner beenden und erneut starten.')
                 else:
                     command = amcl_launch_arguments(args.robot, node.count_publishers(ns+'/map') > 0, directory)
                     child = subprocess.Popen(command, start_new_session=True)

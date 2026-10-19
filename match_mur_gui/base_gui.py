@@ -31,6 +31,7 @@ from mir_srvs.srv import ColorRGB
 
 from match_mur_gui.alignment import plane_alignment, plane_alignments
 from match_mur_gui.ros_discovery import configure_ros_discovery
+from match_mur_gui.processes import stop_ros_process
 
 
 if not os.environ.get("WS"):
@@ -686,6 +687,37 @@ class RosWorker(QtCore.QThread):
         if publisher.get_subscription_count() == 0:
             return False, f"published goal on {topic}, no ROS2 subscriber discovered"
         return True, f"published goal on {topic}: x={x:.3f}, y={y:.3f}, yaw={math.degrees(yaw):.1f} deg"
+
+    def cancel_mir_navigation(self, namespace):
+        if self._node is None:
+            return False, 'ROS helper not ready'
+        from actionlib_msgs.msg import GoalID
+        topic = ros_topic(namespace, 'move_base/cancel')
+        with self._lock:
+            publisher = self._mir_goal_pubs.get(topic)
+            if publisher is None:
+                publisher = self._node.create_publisher(GoalID, topic, 10)
+                self._mir_goal_pubs[topic] = publisher
+        if publisher.get_subscription_count():
+            publisher.publish(GoalID())
+            return True, 'Abbruch an interne MiR-Navigation gesendet'
+        # A newly created volatile publisher must finish DDS matching before
+        # sending this one-shot command. Never latch a cancel across reconnects.
+        started = time.monotonic()
+        timer = None
+        def deliver():
+            if publisher.get_subscription_count():
+                publisher.publish(GoalID())
+                self.log.emit('[ros] Abbruch an interne MiR-Navigation gesendet')
+            elif time.monotonic()-started < 2.:
+                return
+            else:
+                self.log.emit(f'[ros] Kein Abbruch-Empfänger auf {topic}; MiR-Treiber aktualisieren und neu starten')
+            timer.cancel()
+            if self._node is not None:
+                self._node.destroy_timer(timer)
+        timer = self._node.create_timer(.05, deliver)
+        return True, 'MiR-Abbruch angefordert; warte auf Empfänger'
 
     def ensure_mir_pose_subscription(self, namespace):
         if self._node is None:
@@ -1951,6 +1983,13 @@ class MiRGoalDialog(QtWidgets.QDialog):
         top.addWidget(QtWidgets.QLabel("Name"), 1, 0)
         top.addWidget(self.name_edit, 1, 1, 1, 3)
         layout.addLayout(top)
+        self.backend_label = QtWidgets.QLabel()
+        self.backend_label.setWordWrap(True)
+        layout.addWidget(self.backend_label)
+        self.backend_timer = QtCore.QTimer(self)
+        self.backend_timer.timeout.connect(lambda: self.backend_label.setText(self.main_window.mir_navigation_description()))
+        self.backend_timer.start(500)
+        self.backend_label.setText(self.main_window.mir_navigation_description())
 
         coord_box = QtWidgets.QGroupBox("Coordinates")
         coord_layout = QtWidgets.QGridLayout(coord_box)
@@ -1988,6 +2027,9 @@ class MiRGoalDialog(QtWidgets.QDialog):
         saved_layout.addWidget(drive_selected, 1, 0)
         saved_layout.addWidget(delete_selected, 1, 1)
         saved_layout.addWidget(reload_button, 1, 2)
+        cancel_goal = QtWidgets.QPushButton('Navigation abbrechen')
+        cancel_goal.clicked.connect(self.cancel_navigation)
+        saved_layout.addWidget(cancel_goal, 2, 0, 1, 4)
         layout.addWidget(saved_box, 1)
 
         self.reload_poses()
@@ -2093,11 +2135,13 @@ class MiRGoalDialog(QtWidgets.QDialog):
         self.x_spin.setValue(x)
         self.y_spin.setValue(y)
         self.yaw_spin.setValue(math.degrees(yaw))
+        # robot_pose is reported in the MiR map, regardless of the edited target frame.
+        self.frame_edit.setText('map')
         self._upsert_pose(self._pose_from_fields())
 
     def _send_pose(self, pose):
         yaw = math.radians(float(pose.get("yaw_deg", 0.0)))
-        ok, message = self.ros_worker.publish_mir_goal(
+        ok, message = self.main_window.send_mir_navigation_goal(
             self.namespace(),
             pose.get("frame_id", "map"),
             float(pose.get("x", 0.0)),
@@ -2106,6 +2150,10 @@ class MiRGoalDialog(QtWidgets.QDialog):
         )
         level = "ok" if ok else "warn"
         self.main_window.append_log(f"[gui] MiR goal {level}: {message}")
+
+    def cancel_navigation(self):
+        ok, message = self.main_window.cancel_mir_navigation(self.namespace())
+        self.main_window.append_log(f"[gui] Navigation {'ok' if ok else 'warn'}: {message}")
 
     def send_current_fields(self):
         self._send_pose(self._pose_from_fields())
@@ -2147,6 +2195,19 @@ class MurGuiModule:
         return False
 
     def on_shutdown(self):
+        pass
+
+    def on_mir_goal(self, namespace, frame_id, x, y, yaw):
+        """Return (success, message) when handling a goal, or None for native MiR routing."""
+        return None
+
+    def on_mir_cancel(self, namespace):
+        return None
+
+    def mir_navigation_description(self):
+        return None
+
+    def on_mir_manual_control(self):
         pass
 
 
@@ -3987,6 +4048,8 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self._arm_alignment_dialog = dialog
 
     def open_mir_jog(self):
+        for module in self.modules:
+            module.on_mir_manual_control()
         dialog = getattr(self, "_mir_jog_dialog", None)
         if dialog is None:
             dialog = MiRJogDialog(self, self)
@@ -4008,6 +4071,27 @@ class MurBaseGui(QtWidgets.QMainWindow):
         dialog.raise_()
         dialog.activateWindow()
         self._mir_goal_dialog = dialog
+
+    def send_mir_navigation_goal(self, namespace, frame_id, x, y, yaw):
+        for module in self.modules:
+            result = module.on_mir_goal(namespace, frame_id, x, y, yaw)
+            if result is not None:
+                return result
+        return self.ros_worker.publish_mir_goal(namespace, frame_id, x, y, yaw)
+
+    def cancel_mir_navigation(self, namespace):
+        for module in self.modules:
+            result = module.on_mir_cancel(namespace)
+            if result is not None:
+                return result
+        return self.ros_worker.cancel_mir_navigation(namespace)
+
+    def mir_navigation_description(self):
+        for module in self.modules:
+            description = module.mir_navigation_description()
+            if description:
+                return description
+        return 'Zielbackend: interne MiR-Navigation'
 
     def stop_module_motion_like_actions(self):
         for module in self.modules:
@@ -4423,6 +4507,9 @@ class MurBaseGui(QtWidgets.QMainWindow):
             if process.state() == QtCore.QProcess.NotRunning:
                 continue
             self.append_log(f"[gui] terminating {name}")
+            if name.startswith('navigation_'):
+                stop_ros_process(process)
+                continue
             process.terminate()
             timeout = 6500 if name == 'base_mocap_support' or name.endswith(':amcl_support') else 1500
             if not process.waitForFinished(timeout):
