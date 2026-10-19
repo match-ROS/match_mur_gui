@@ -36,6 +36,47 @@ source "$WS"/install/setup.bash
 ros2 run match_mur_gui general_mur_gui.py
 ```
 
+## Lokalisierung beim Hardwarestart
+
+Mit aktivierter **mir**-Checkbox unter **MiR-Lokalisierung** die gewünschte
+Quelle auswählen und anschließend **Start Hardware** drücken. Die Auswahl gilt
+für diesen Start und alle dabei ausgewählten MuRs. Ein bereits laufender
+Hardwaretreiber wird dadurch nicht umgeschaltet.
+
+| Auswahl | Verhalten |
+| --- | --- |
+| **MiR-Controller** (Voreinstellung) | Ausschließlich die native `robot_pose` der MiR, auch wenn Mocap bereits läuft. |
+| **Mocap / Qualisys** | Ausschließlich die kalibrierte Qualisys-Pose im Frame `map`. Die Empfangs-Bridge wird gestartet oder wiederverwendet. |
+| **AMCL · gespeicherte Navigationskarte** | Lokalen Kartenserver und AMCL starten oder vorhandene Sitzung verwenden. Laser und Encoder-Odometrie liefern die laufende Pose. |
+
+Die Mocap-GUI wählt beim Öffnen **Mocap** vor; die Auswahl lässt sich vor dem
+Hardwarestart ändern. Für Mocap und AMCL bleibt der lokale Empfangshelfer als
+GUI-Prozess aktiv. Er aktiviert bei Bedarf die geprüfte Map-Ausgabe einer
+vorhandenen Bridge, statt einen zweiten QTM-Datenstrom zu starten. Eine ältere
+Bridge ohne diesen Dienst und ohne Map-Ausgabe einmal nach dem Update neu starten.
+Fremde Kartenserver und AMCL-Sitzungen werden verwendet und beim Schließen
+dieser GUI nicht beendet.
+
+Der AMCL-Modus nutzt zunächst `mur620c_mocap.yaml` im Navigationspaket (oder die
+bereits im selben Lokalisierungs-Namespace geladene Karte). Die Startpose kommt
+wie beim bisherigen Vergleich einmalig aus Mocap; danach arbeitet AMCL ohne
+laufende Mocap-Korrektur. Für den globalen Kartenbezug wird die bestehende,
+geprüfte `map -> mocap`-Kalibrierung benötigt. **Open RViz** öffnet die
+Navigationsansicht, wenn AMCL gewählt ist. Die Vergleichs-GUI kann unabhängig
+davon eine Standmessung aktivieren.
+
+Die Auswahl legt die Quelle der **ROS-Roboterpose** fest. Der Hardwareselektor
+veröffentlicht als einzige Instanz `map -> <robot>/base_footprint`; AMCLs
+interner TF-Baum bleibt privat. Ohne frische Daten der gewählten Quelle bleibt
+die Lokalisierung wartend; es gibt keinen stillen Rückfall auf eine andere
+Quelle. Die interne Fahrsteuerung der MiR wird damit nicht ersetzt.
+
+Beim ersten Hardwarestart nach dem Update **Sync Code** und **Build before
+launch** aktiviert lassen, damit `mir_localization_source` und der aktualisierte
+Selektor auch auf dem MuR verfügbar sind. CLI-Starts unterstützen
+`mir_localization_source:=mir|mocap|amcl`; das bisherige `auto` bleibt als
+CLI-Voreinstellung für bestehende Skripte erhalten.
+
 ## Batteriedetails
 
 Die MiR- und MuR-Batteriesymbole links oben zeigen den Ladezustand. Hover zeigt

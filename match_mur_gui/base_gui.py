@@ -2142,6 +2142,10 @@ class MurGuiModule:
     def on_robot_selection_changed(self):
         pass
 
+    def on_open_rviz(self):
+        """Return True when this module opens its own RViz view."""
+        return False
+
     def on_shutdown(self):
         pass
 
@@ -2447,6 +2451,18 @@ class MurBaseGui(QtWidgets.QMainWindow):
         layout.addRow(self.arm_r)
         layout.addRow(self.arm_l)
         layout.addRow(self.mir_enabled_check)
+        self.localization_source = QtWidgets.QComboBox()
+        self.localization_source.addItem('MiR-Controller', 'mir')
+        self.localization_source.addItem('Mocap / Qualisys', 'mocap')
+        self.localization_source.addItem('AMCL · gespeicherte Navigationskarte', 'amcl')
+        self.localization_source.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.localization_source.setMinimumContentsLength(12)
+        self.localization_source.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
+        self.localization_source.setToolTip('Gilt beim nächsten Hardware-Start für die ausgewählten MuRs. '
+            'Die gewählte Quelle wird fest verwendet; kein automatischer Quellenwechsel.')
+        self.localization_source.setEnabled(self.mir_enabled_check.isChecked())
+        self.mir_enabled_check.toggled.connect(self.localization_source.setEnabled)
+        layout.addRow('MiR-Lokalisierung', self.localization_source)
         layout.addRow(self.mir_camera_check)
         return box
 
@@ -3650,6 +3666,9 @@ class MurBaseGui(QtWidgets.QMainWindow):
         if running is not None and running.state() != QtCore.QProcess.NotRunning:
             self.append_log(f"[gui] {robot}: hardware already running")
             return
+        localization = self.localization_source.currentData() if hasattr(self, 'localization_source') else 'mir'
+        if self.launch_mir_enabled() and not self.prepare_base_localization(robot, localization):
+            return
         expected_reverse_ip = "192.168.12.69" if robot == "mur620d" else ""
         args = [
             f"robot_name:={robot}",
@@ -3657,6 +3676,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
             f"launch_ur_r:={'true' if self.arm_r.isChecked() else 'false'}",
             f"launch_ur_l:={'true' if self.arm_l.isChecked() else 'false'}",
             f"launch_mir:={'true' if self.launch_mir_enabled() else 'false'}",
+            f"mir_localization_source:={localization}",
             f"launch_mir_cameras:={'true' if self.mir_camera_check.isChecked() else 'false'}",
             f"integrated_controller_enable_collision_avoidance:={'true' if self.opt_collision.isChecked() else 'false'}",
             f"integrated_controller_publish_collision_markers:={'true' if self.opt_markers.isChecked() else 'false'}",
@@ -3711,6 +3731,31 @@ class MurBaseGui(QtWidgets.QMainWindow):
             self.process_key(robot, "hardware"), command,
             on_finished=lambda _code, _status: self._ur_starting_pairs.difference_update(startup_pairs),
         )
+
+    def prepare_base_localization(self, robot, source):
+        self.append_log(f'[localization] {robot}: feste Lokalisierungsquelle {source}; gilt für diesen Hardware-Start.')
+        if source == 'mir':
+            return True
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            get_package_share_directory('match_mocap_ros2')
+            if source == 'amcl':
+                for package in ('match_mur_navigation', 'nav2_amcl', 'nav2_map_server', 'nav2_lifecycle_manager'):
+                    get_package_share_directory(package)
+                from match_mur_navigation.saved_map import default_map, map_metadata
+                map_metadata(default_map())
+        except Exception as exc:
+            self.append_log(f'[localization] Start abgebrochen: Lokalisierungsabhängigkeit oder Karte fehlt: {exc}')
+            return False
+        def ensure(name, arguments):
+            process = self.processes.get(name)
+            if process is None or process.state() == QtCore.QProcess.NotRunning:
+                self.start_process(name, setup_prefix()+'exec python3 -m match_mur_gui.localization_support '+
+                                   shlex.join(arguments))
+        ensure('base_mocap_support', ['--mode', 'mocap'])
+        if source == 'amcl':
+            ensure(self.process_key(robot, 'amcl_support'), ['--mode', 'amcl', '--robot', robot])
+        return True
 
     def ensure_ur_ready(self, sides=None, robots=None, on_success=None, retry_count=0):
         if isinstance(sides, bool):
@@ -4199,6 +4244,15 @@ class MurBaseGui(QtWidgets.QMainWindow):
             self.ros_worker.switch_freedrive(robot, side, False, fallback)
 
     def open_rviz(self):
+        for module in self.modules:
+            if module.on_open_rviz():
+                return
+        if self.launch_mir_enabled() and self.localization_source.currentData() == 'amcl':
+            robot = self.object_host()
+            self.start_process(self.process_key(robot, 'amcl_rviz'), setup_prefix()+
+                'exec python3 -m match_mur_navigation.rviz '+shlex.join(
+                    ['--robot', robot, '--mode', 'localization']))
+            return
         robot = self.object_host()
         config_path = (
             "$(ros2 pkg prefix mur_launch_hardware)"
@@ -4370,7 +4424,8 @@ class MurBaseGui(QtWidgets.QMainWindow):
                 continue
             self.append_log(f"[gui] terminating {name}")
             process.terminate()
-            if not process.waitForFinished(1500):
+            timeout = 6500 if name == 'base_mocap_support' or name.endswith(':amcl_support') else 1500
+            if not process.waitForFinished(timeout):
                 process.kill()
 
     def closeEvent(self, event):
