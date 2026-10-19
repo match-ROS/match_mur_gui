@@ -30,6 +30,7 @@ from ewellix_interfaces.msg import Command as EwellixCommand, State as EwellixSt
 from mir_srvs.srv import ColorRGB
 
 from match_mur_gui.alignment import plane_alignment, plane_alignments
+from match_mur_gui.ros_discovery import configure_ros_discovery
 
 
 if not os.environ.get("WS"):
@@ -1772,7 +1773,6 @@ class MiRJogDialog(QtWidgets.QDialog):
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._tick)
-        self.timer.start(50)
 
     def namespace(self):
         return self.namespace_combo.currentText().strip()
@@ -1789,6 +1789,9 @@ class MiRJogDialog(QtWidgets.QDialog):
         self.active_angular = float(angular_sign) * self.angular_speed.value()
 
     def _tick(self):
+        # Idle dialogs must not overwrite another controller's drive commands.
+        if not self.isVisible() or (self.active_linear == 0.0 and self.active_angular == 0.0):
+            return
         self.ros_worker.publish_mir_twist(
             self.namespace(),
             self.active_linear,
@@ -1828,9 +1831,15 @@ class MiRJogDialog(QtWidgets.QDialog):
             return
         super().keyReleaseEvent(event)
 
-    def closeEvent(self, event):
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.timer.start(50)
+
+    def hideEvent(self, event):
+        # Closing, hiding and Escape all leave the dialog alive under its parent.
+        self.timer.stop()
         self.stop()
-        super().closeEvent(event)
+        super().hideEvent(event)
 
 
 class MiRLightDialog(QtWidgets.QDialog):
@@ -2258,9 +2267,10 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self.log_filter_buttons = {}
         self.gui_log_path = self._create_gui_log_file()
 
-        # MuR620c's DDS multicast discovery is unreliable from the GUI host.
-        # An explicit peer also covers CLI processes started from this GUI.
-        os.environ.setdefault("ROS_STATIC_PEERS", "mur620c")
+        # Set DDS profiles before RosWorker or any extension initializes ROS.
+        # Child processes (RViz, mapping, etc.) inherit the same configuration.
+        discovery_message = configure_ros_discovery(
+            ROBOTS, os.path.join(os.path.dirname(self.gui_log_path), "dds"))
         self.ros_worker = RosWorker(["mur620d"])
         self.ros_worker.log.connect(self.append_log)
         self.ros_worker.freedrive_status.connect(self.update_freedrive_status)
@@ -2365,6 +2375,7 @@ class MurBaseGui(QtWidgets.QMainWindow):
             module.setup_ui(self.module_context)
 
         self.append_log(f"[gui] Logging to {self.gui_log_path}")
+        self.append_log(f"[ros] {discovery_message}")
         self.append_log("[gui] Ready. General MuR controls are active.")
 
     def _create_gui_log_file(self):
@@ -3931,11 +3942,13 @@ class MurBaseGui(QtWidgets.QMainWindow):
         self._arm_alignment_dialog = dialog
 
     def open_mir_jog(self):
-        dialog = MiRJogDialog(self, self)
+        dialog = getattr(self, "_mir_jog_dialog", None)
+        if dialog is None:
+            dialog = MiRJogDialog(self, self)
+            self._mir_jog_dialog = dialog
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
-        self._mir_jog_dialog = dialog
 
     def open_mir_lights(self):
         dialog = MiRLightDialog(self, self)
