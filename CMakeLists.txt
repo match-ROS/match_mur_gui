@@ -26,6 +26,8 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_app_icon test/test_app_icon.py)
   ament_add_pytest_test(test_gui_layout test/test_gui_layout.py)
   ament_add_pytest_test(test_ur_shutdown test/test_ur_shutdown.py)
+  ament_add_pytest_test(test_ros_discovery test/test_ros_discovery.py)
+  ament_add_pytest_test(test_mir_jog test/test_mir_jog.py)
 endif()
 
 ament_package()
