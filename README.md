@@ -36,6 +36,21 @@ python3 scripts/install_gui_desktop.py --app all
 
 Danach in der Ubuntu-Anwendungssuche nach „MuR Basis-GUI“, „MuR Mocap“, „MuR Cooperative Handling“, „MuR OAK Kamera“ oder „MuR Navigation“ suchen oder die gleichnamigen Desktop-Icons doppelklicken. Der Installer prüft die vorhandenen ROS-Executables, bevor er Dateien anlegt. Jede Verknüpfung lädt beim Start `/opt/ros/jazzy/setup.bash` und das Workspace-Setup; ein Terminal ist nicht nötig. Ohne vorgegebene `ROS_DOMAIN_ID` verwendet sie Domain 62. Sie startet nur die gewählte GUI und keine Roboterhardware.
 
+Alle GUIs mit der gemeinsamen MuR-Basis konfigurieren vor dem ROS-Start automatisch
+direkte DDS-Peers für die per SSH erreichbaren Hostnamen `mur620a` bis `mur620d`. Dadurch
+funktioniert die Verbindung auch ohne zuverlässige Multicast-Erkennung. Die
+Konfiguration berücksichtigt die aktuelle `ROS_DOMAIN_ID` (Standard 62) und liegt
+unter `logs/gui/dds/`; sie wird bei Bedarf neu erzeugt. RViz und Kartierung erben
+dieselbe Einstellung. Ein separates Bash-Skript oder eine Datei unter `/tmp` ist
+nicht erforderlich. Auch `ros2 run` verwendet diese automatische Konfiguration.
+Im GUI-Log zeigt `DDS: direct peers ...` die verwendeten Adressen und die Domain.
+
+Vorhandene gültige Fast-DDS-Profile, ein expliziter Discovery-Server, eine andere
+Middleware oder eine ausdrücklich auf localhost beschränkte Erkennung bleiben
+erhalten. Weitere direkte Peers können über `ROS_STATIC_PEERS` mit Semikolon
+getrennt ergänzt werden. Nach einem Netzwerk- oder Adresswechsel die GUI neu
+starten, damit die Adressen vor dem Start der ROS-Kontexte erneut aufgelöst werden.
+
 Mit `--app base` wird nur die Basis-GUI installiert; weitere Werte sind `mocap`, `cooperative`, `oak` und `navigation`. `--workspace PFAD` wählt einen anderen Colcon-Workspace, `--no-desktop-shortcut` erzeugt nur Einträge für die Anwendungssuche. Der Aufruf ist wiederholbar. Bestehende fremde Dateien mit denselben Namen werden nicht überschrieben. Auf GNOME werden Desktop-Verknüpfungen als vertrauenswürdig markiert; falls der Dateimanager dies nicht unterstützt, im Kontextmenü „Starten erlauben“ wählen.
 
 ## Home über MoveIt

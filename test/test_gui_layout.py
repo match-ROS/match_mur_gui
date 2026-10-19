@@ -6,9 +6,48 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5 import QtWidgets
+import pytest
 from sensor_msgs.msg import BatteryState
 
 from match_mur_gui import base_gui
+
+
+@pytest.fixture(autouse=True)
+def isolated_discovery(monkeypatch):
+    monkeypatch.setattr(base_gui, 'configure_ros_discovery', lambda *_args: 'DDS test configuration')
+
+
+def test_discovery_is_ready_before_ros_worker_and_extensions_start(monkeypatch, tmp_path):
+    from pathlib import Path
+    from match_mur_gui.ros_discovery import configure_ros_discovery
+    for key in ('FASTRTPS_DEFAULT_PROFILES_FILE', 'FASTDDS_DEFAULT_PROFILES_FILE',
+                'ROS_DISCOVERY_SERVER', 'ROS_LOCALHOST_ONLY', 'RMW_IMPLEMENTATION'):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv('ROS_DOMAIN_ID', '62')
+    monkeypatch.setenv('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET')
+    # Ensure assignments made by the helper are restored after this test too.
+    monkeypatch.setenv('FASTRTPS_DEFAULT_PROFILES_FILE', '')
+    monkeypatch.setenv('FASTDDS_DEFAULT_PROFILES_FILE', '')
+    monkeypatch.setattr(base_gui, 'configure_ros_discovery',
+                        lambda hosts, directory: configure_ros_discovery(
+                            hosts, directory, resolver=lambda host: ['10.145.8.41'],
+                            reachable=lambda address: True))
+    ready = []
+    class Worker(_RosWorker):
+        def start(self):
+            ready.append(Path(os.environ['FASTRTPS_DEFAULT_PROFILES_FILE']).is_file())
+    class Module(base_gui.MurGuiModule):
+        def setup_ui(self, context):
+            ready.append(Path(os.environ['FASTRTPS_DEFAULT_PROFILES_FILE']).is_file())
+    monkeypatch.setattr(base_gui, 'RosWorker', Worker)
+    monkeypatch.setattr(base_gui.MurBaseGui, '_create_gui_log_file',
+                        lambda self: str(tmp_path / 'gui.log'))
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    window = base_gui.MurBaseGui(modules=[Module()])
+    window.stop_managed_processes = lambda: None
+    assert ready == [True, True]
+    assert any('DDS: direct peers 10.145.8.41' in text for _level, text in window.log_entries)
+    window.close()
 
 
 class _Signal:
