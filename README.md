@@ -1,10 +1,38 @@
 # match_mur_gui
 
+**Required: configure your workspace path in `~/.bashrc` before using these commands.**
+Replace the example directory below with the actual name and location of your
+workspace. `WS` must point to the workspace root containing `src/`, not to a
+repository inside `src/`. There is no automatic workspace discovery.
+
+```bash
+# Add these lines to ~/.bashrc; adjust the workspace folder to match your setup.
+export WS="$HOME/your_workspace_folder"
+source /opt/ros/jazzy/setup.bash
+if [ -f "$WS/install/setup.bash" ]; then
+    source "$WS/install/setup.bash"
+fi
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-62}"
+```
+
+Then reload and verify the configured path:
+
+```bash
+source ~/.bashrc
+printf 'Workspace: %s\n' "$WS"
+test -d "$WS/src" && echo "Workspace src directory found" || echo "Fix WS in ~/.bashrc"
+```
+
+Check that the printed path matches your actual workspace folder name. Update
+`WS` whenever you move or rename the workspace. Remote workspaces can differ;
+set `REMOTE_WS` or the GUI's Remote WS field to the path on the remote computer.
+
+
 Gemeinsame PyQt5-Basisoberfläche für die MuR-Roboter. Nach dem Build von ROS 2 Jazzy und dem Colcon-Workspace startet sie mit:
 
 ```bash
 source /opt/ros/jazzy/setup.bash
-source /home/rosmatch/colcon_ws/install/setup.bash
+source "$WS"/install/setup.bash
 ros2 run match_mur_gui general_mur_gui.py
 ```
 
@@ -30,7 +58,7 @@ Hardwareprozesse neu starten.
 Der Installer legt für die Basis-GUI und auf Wunsch für Mocap, Cooperative Handling, OAK und Navigation eigene Starteinträge und Icons im Stil der MuR-Diagnose an. Er richtet die Verknüpfungen für den aktuellen Benutzer ohne `sudo` ein. Die benötigten ROS-Pakete müssen zuvor im Workspace gebaut sein.
 
 ```bash
-cd /home/rosmatch/colcon_ws/src/match_mur_gui
+cd "$WS"/src/match_mur_gui
 python3 scripts/install_gui_desktop.py --app all
 ```
 

@@ -93,6 +93,7 @@ def _launcher(app: str, ros_setup: Path, workspace: Path) -> bytes:
     return ('#!/usr/bin/env bash\n'
             f'# Managed by {MARKER}\n'
             'set -e\n'
+            f'export WS={shlex.quote(str(workspace))}\n'
             'export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-62}"\n'
             f'source {shlex.quote(str(ros_setup))}\n'
             f'source {shlex.quote(str(setup))}\n'

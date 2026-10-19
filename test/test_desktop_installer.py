@@ -74,6 +74,7 @@ def test_workspace_with_spaces_is_quoted_in_launcher(tmp_path, monkeypatch):
                       shortcut_dir=None, ros_setup=Path('/opt/ros/jazzy/setup.bash'),
                       workspace=workspace, validate=False)
     launcher = (tmp_path / 'bin/mur-oak-gui').read_text()
+    assert f"export WS='{workspace}'" in launcher
     assert f"source '{workspace}/install/setup.bash'" in launcher
     assert list((tmp_path / 'share/applications').glob('*.desktop')) == [
         tmp_path / 'share/applications/mur-oak-gui.desktop']

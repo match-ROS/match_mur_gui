@@ -32,8 +32,10 @@ from mir_srvs.srv import ColorRGB
 from match_mur_gui.alignment import plane_alignment, plane_alignments
 
 
-WS = os.environ.get("WS", "/home/rosmatch/colcon_ws")
-REMOTE_WS_DEFAULT = os.environ.get("REMOTE_WS", "/home/rosmatch/colcon_ws")
+if not os.environ.get("WS"):
+    raise RuntimeError("Set WS to your workspace root in ~/.bashrc, then source ~/.bashrc")
+WS = os.path.abspath(os.path.expanduser(os.environ["WS"]))
+REMOTE_WS_DEFAULT = os.environ.get("REMOTE_WS", WS)
 HARDWARE_SCRIPT = os.path.join(
     WS, "src", "match_mobile_robotics_jazzy", "start_mur620_hardware_logged.sh"
 )
