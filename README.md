@@ -36,6 +36,23 @@ source "$WS"/install/setup.bash
 ros2 run match_mur_gui general_mur_gui.py
 ```
 
+## Persönliche Einstellungen
+
+Basis-, Mocap- und Navigations-GUI merken sich Änderungen an der Roboterauswahl,
+dem Feld **Remote WS**, den UR-Armseiten, MiR inklusive Kameras, der
+MiR-Lokalisierungsquelle sowie den Checkboxen unter **Launch Options** und
+**Sync Code** automatisch. Beim nächsten Start werden diese gemeinsamen
+Einstellungen wiederhergestellt. Hardware wird weiterhin erst über **Start
+Hardware** gestartet.
+
+Die benutzerspezifische Datei liegt außerhalb der Repositories unter
+`~/.config/match_mur_gui/settings.ini` (bei gesetztem absolutem
+`XDG_CONFIG_HOME` unter `$XDG_CONFIG_HOME/match_mur_gui/settings.ini`). Sie
+wird daher nicht mit Git versioniert oder gepusht. Zum Zurücksetzen alle GUIs
+schließen und diese Datei löschen. Ohne gespeicherte Werte gelten die bisherigen
+Voreinstellungen; für **Remote WS** zunächst `REMOTE_WS` beziehungsweise `WS`.
+Eine gespeicherte Remote-WS-Auswahl hat bei späteren Starts Vorrang.
+
 ## Lokalisierung beim Hardwarestart
 
 Mit aktivierter **mir**-Checkbox unter **MiR-Lokalisierung** die gewünschte
@@ -95,6 +112,26 @@ Nach dem Aktualisieren von `match_mur_gui`, `mir_launch_hardware` und
 Hardwareprozesse neu starten.
 
 ## Ubuntu-Anwendungssuche und Desktop-Icon
+
+### Inbetriebnahme auf dem Bedienrechner
+
+Nach dem Build bei der Ersteinrichtung jedes Ubuntu-Bedienrechners die drei
+Desktop-Verknüpfungen für Basis-GUI, Mocap und Navigation installieren.
+`WS` muss wie oben beschrieben auf den Workspace zeigen; die Pakete
+`match_mur_gui`, `match_mocap_gui` und `match_mur_navigation` müssen gebaut sein.
+
+```bash
+for app in base mocap navigation; do
+  python3 "$WS"/src/match_mur_gui/scripts/install_gui_desktop.py \
+    --workspace "$WS" --app "$app" || break
+done
+```
+
+Danach stehen **MuR Basis-GUI**, **MuR Mocap** und **MuR Navigation** auf dem
+Desktop und in der Anwendungssuche bereit. Nach dem Verschieben des Workspaces
+den Installer mit dem aktualisierten `WS` erneut ausführen.
+
+### Weitere Installationsoptionen
 
 Der Installer legt für die Basis-GUI und auf Wunsch für Mocap, Cooperative Handling, OAK und Navigation eigene Starteinträge und Icons im Stil der MuR-Diagnose an. Er richtet die Verknüpfungen für den aktuellen Benutzer ohne `sudo` ein. Die benötigten ROS-Pakete müssen zuvor im Workspace gebaut sein.
 

@@ -16,7 +16,7 @@ def main():
     icon = configure_gui_icon(app, "mur-base-gui")
     window = MurBaseGui(window_title="General MuR GUI")
     window.setWindowIcon(icon)
-    window.show()
+    window.showFullScreen()
     sys.exit(app.exec_())
 
 

@@ -13,7 +13,8 @@ from match_mur_gui import base_gui
 
 
 @pytest.fixture(autouse=True)
-def isolated_discovery(monkeypatch):
+def isolated_discovery(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setattr(base_gui, 'configure_ros_discovery', lambda *_args: 'DDS test configuration')
 
 
@@ -166,3 +167,39 @@ def test_battery_badge_shows_charging_details_and_stale_data():
     assert 'keine aktuellen Daten' in text
     assert '16.60 A' not in text
     badge.close()
+
+
+def test_user_settings_survive_restart(monkeypatch, tmp_path):
+    monkeypatch.setattr(base_gui, "RosWorker", _RosWorker)
+    monkeypatch.setattr(base_gui.MurBaseGui, "_create_gui_log_file",
+                        lambda self: str(tmp_path / "gui.log"))
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    window = base_gui.MurBaseGui()
+    window.robot_checks["mur620d"].setChecked(False)
+    window.robot_checks["mur620b"].setChecked(True)
+    window.remote_ws_edit.setText("/home/rosmatch/robot workspace")
+    window.arm_l.setChecked(False)
+    window.opt_ft.setChecked(False)
+    window.mir_camera_check.setChecked(True)
+    window.localization_source.setCurrentIndex(window.localization_source.findData("amcl"))
+    window.stop_managed_processes = lambda: None
+    window.close()
+
+    restored = base_gui.MurBaseGui()
+    assert restored.checked_robots() == ["mur620b"]
+    assert restored.remote_ws() == "/home/rosmatch/robot workspace"
+    assert not restored.arm_l.isChecked()
+    assert restored.arm_r.isChecked()
+    assert not restored.opt_ft.isChecked()
+    assert restored.mir_enabled_check.isChecked()
+    assert restored.mir_camera_check.isChecked()
+    assert restored.localization_source.currentData() == "amcl"
+    assert (tmp_path / "config/match_mur_gui/settings.ini").is_file()
+    # An intentionally empty robot selection must also survive a restart.
+    restored.robot_checks["mur620b"].setChecked(False)
+    restored.stop_managed_processes = lambda: None
+    restored.close()
+    empty = base_gui.MurBaseGui()
+    assert empty.checked_robots() == []
+    empty.stop_managed_processes = lambda: None
+    empty.close()

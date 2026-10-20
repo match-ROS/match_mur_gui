@@ -2439,9 +2439,57 @@ class MurBaseGui(QtWidgets.QMainWindow):
         for module in self.modules:
             module.setup_ui(self.module_context)
 
+        self._initialize_persistent_settings()
+
         self.append_log(f"[gui] Logging to {self.gui_log_path}")
         self.append_log(f"[ros] {discovery_message}")
         self.append_log("[gui] Ready. General MuR controls are active.")
+
+    def _initialize_persistent_settings(self):
+        config_home = os.environ.get("XDG_CONFIG_HOME", "")
+        if not os.path.isabs(config_home):
+            config_home = os.path.expanduser("~/.config")
+        path = os.path.join(config_home, "match_mur_gui", "settings.ini")
+        self._settings = QtCore.QSettings(path, QtCore.QSettings.IniFormat)
+        self._persistent_checks = {
+            **{f"robots/{name}": check for name, check in self.robot_checks.items()},
+            **{f"launch/{name}": getattr(self, name) for name in (
+                "arm_l", "arm_r", "mir_enabled_check", "mir_camera_check",
+                "opt_sync_code", "opt_build", "opt_integrated", "opt_ft",
+                "opt_require_wrench", "opt_collision", "opt_markers",
+                "opt_zero_admittance", "opt_moveit",
+            )},
+        }
+        # Restore after extension defaults, before connecting persistence signals.
+        # Keep existing widget signals active (camera/MiR dependencies, ROS selection).
+        for key, check in self._persistent_checks.items():
+            value = self._settings.value(key)
+            if isinstance(value, bool) or value in ("true", "false"):
+                check.setChecked(value is True or value == "true")
+        remote_ws = self._settings.value("remote_ws")
+        if isinstance(remote_ws, str):
+            self.remote_ws_edit.setText(remote_ws)
+        source = self._settings.value("localization_source")
+        index = self.localization_source.findData(source)
+        if index >= 0:
+            self.localization_source.setCurrentIndex(index)
+        for key, check in self._persistent_checks.items():
+            check.toggled.connect(
+                lambda checked, key=key: self._persist_setting(key, checked))
+        self.remote_ws_edit.textChanged.connect(
+            lambda text: self._persist_setting("remote_ws", text))
+        self.localization_source.currentIndexChanged.connect(
+            lambda _index: self._persist_setting(
+                "localization_source", self.localization_source.currentData()))
+        self.append_log(f"[gui] User settings: {path}")
+
+    def _persist_setting(self, key, value):
+        self._settings.setValue(key, value)
+        self._settings.sync()
+        if (self._settings.status() != QtCore.QSettings.NoError
+                and not getattr(self, "_settings_error_reported", False)):
+            self._settings_error_reported = True
+            self.append_log("[gui] Could not save user settings: " + self._settings.fileName())
 
     def _create_gui_log_file(self):
         os.makedirs(GUI_LOG_DIR, exist_ok=True)
